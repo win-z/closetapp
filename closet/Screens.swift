@@ -17,6 +17,9 @@ private enum PageHeaderStyle {
     static func badgeVerticalPadding(for metrics: LayoutMetrics) -> CGFloat { metrics.value(6) }
     static func spacing(for metrics: LayoutMetrics) -> CGFloat { metrics.value(10) }
     static func minHeight(for metrics: LayoutMetrics) -> CGFloat { metrics.value(40) }
+    static func sectionSpacing(for metrics: LayoutMetrics) -> CGFloat { metrics.value(16) }
+    static func contentTopSpacing(for metrics: LayoutMetrics) -> CGFloat { metrics.value(12) }
+    static func contentBottomSpacing(for metrics: LayoutMetrics) -> CGFloat { metrics.value(2) }
     static func actionHeight(for metrics: LayoutMetrics) -> CGFloat { metrics.value(40) }
     static func actionCornerRadius(for metrics: LayoutMetrics) -> CGFloat { metrics.value(14) }
     static func actionHorizontalPadding(for metrics: LayoutMetrics) -> CGFloat { metrics.value(12) }
@@ -32,7 +35,7 @@ private struct HeaderBadgeView: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: PageHeaderStyle.badgeSize(for: metrics), weight: .bold, design: .rounded))
+            .font(.system(size: PageHeaderStyle.badgeSize(for: metrics), weight: .black, design: .rounded))
             .foregroundStyle(ClosetTheme.rose)
             .padding(.horizontal, PageHeaderStyle.badgeHorizontalPadding(for: metrics))
             .padding(.vertical, PageHeaderStyle.badgeVerticalPadding(for: metrics))
@@ -209,7 +212,7 @@ struct WardrobeScreen: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: metrics.value(16)) {
+                VStack(alignment: .leading, spacing: PageHeaderStyle.sectionSpacing(for: metrics)) {
                     PageHeader(
                         title: store.currentClosetName,
                         badge: "",
@@ -281,7 +284,7 @@ struct WardrobeScreen: View {
                     )
 
                 SearchBar(text: $searchText, placeholder: "搜索名称、颜色、品牌...", metrics: metrics)
-                    .padding(.top, metrics.value(12))
+                    .padding(.top, PageHeaderStyle.contentTopSpacing(for: metrics))
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: metrics.value(8)) {
@@ -332,7 +335,7 @@ struct WardrobeScreen: View {
                     }
                     .padding(.horizontal, 2)
                 }
-                .padding(.bottom, metrics.value(2))
+                .padding(.bottom, PageHeaderStyle.contentBottomSpacing(for: metrics))
 
                 if isBatchMode {
                     FrostedCard {
@@ -822,22 +825,6 @@ private struct WardrobeModeCluster: View {
                 onOutfitTap()
             }
         }
-        .padding(metrics.value(6))
-        .background(
-            RoundedRectangle(cornerRadius: metrics.value(18), style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.82), Color(red: 0.95, green: 0.96, blue: 0.985).opacity(0.78)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: metrics.value(18), style: .continuous)
-                        .stroke(.white.opacity(0.72), lineWidth: 1)
-                )
-        )
-        .shadow(color: ClosetTheme.tabShadow.opacity(0.32), radius: 12, y: 6)
     }
 
     private func modeButton(
@@ -925,27 +912,6 @@ private struct OutfitSelectionActionBar: View {
     }
 }
 
-private struct AnalyticsHeaderButton: View {
-    let title: String
-    let icon: String
-    let filled: Bool
-    let metrics: LayoutMetrics
-
-    var body: some View {
-        HStack(spacing: PageHeaderStyle.actionSpacing(for: metrics)) {
-            Image(systemName: icon)
-                .font(.system(size: PageHeaderStyle.actionIconSize(for: metrics), weight: .semibold))
-            Text(title)
-                .font(.system(size: PageHeaderStyle.actionFontSize(for: metrics), weight: .bold))
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, PageHeaderStyle.actionHorizontalPadding(for: metrics))
-        .frame(height: PageHeaderStyle.actionHeight(for: metrics))
-        .background(filled ? AnyShapeStyle(ClosetTheme.slate) : AnyShapeStyle(ClosetTheme.accentGradient))
-        .clipShape(RoundedRectangle(cornerRadius: PageHeaderStyle.actionCornerRadius(for: metrics)))
-    }
-}
-
 struct WardrobeSummaryChip: View {
     let icon: String
     let value: String
@@ -988,7 +954,7 @@ struct StylistScreen: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: metrics.value(16)) {
+                VStack(alignment: .leading, spacing: PageHeaderStyle.sectionSpacing(for: metrics)) {
 
                     PageHeader(
                         title: "我的搭配",
@@ -999,7 +965,7 @@ struct StylistScreen: View {
                     )
 
                     SearchBar(text: $searchText, placeholder: "搜索搭配名称、单品名...", metrics: metrics)
-                        .padding(.top, metrics.value(12))
+                        .padding(.top, PageHeaderStyle.contentTopSpacing(for: metrics))
 
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: metrics.value(8)) {
@@ -1018,7 +984,7 @@ struct StylistScreen: View {
                         }
                         .padding(.horizontal, 2)
                     }
-                    .padding(.bottom, metrics.value(2))
+                    .padding(.bottom, PageHeaderStyle.contentBottomSpacing(for: metrics))
 
                     SavedOutfitsGrid(
                         store: store,
@@ -1301,7 +1267,7 @@ struct CalendarScreen: View {
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: metrics.value(14)) {
+            VStack(alignment: .leading, spacing: PageHeaderStyle.sectionSpacing(for: metrics)) {
                 PageHeader(
                     title: "穿搭日记",
                     badge: "OOTD",
@@ -1469,32 +1435,20 @@ struct AnalyticsScreen: View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: metrics.value(14)) {
 
-                // ── Header ────────────────────────────────────────
-                HStack(alignment: .center, spacing: PageHeaderStyle.spacing(for: metrics)) {
-                    HStack(alignment: .center, spacing: metrics.value(8)) {
-                        Text("衣橱分析")
-                            .font(.system(size: PageHeaderStyle.titleSize(for: metrics), weight: .heavy))
-                            .foregroundStyle(ClosetTheme.textPrimary)
-                            .lineLimit(1)
-                        Text("STATS")
-                            .font(.system(size: PageHeaderStyle.badgeSize(for: metrics), weight: .black, design: .rounded))
-                            .foregroundStyle(ClosetTheme.rose)
-                            .padding(.horizontal, PageHeaderStyle.badgeHorizontalPadding(for: metrics))
-                            .padding(.vertical, PageHeaderStyle.badgeVerticalPadding(for: metrics))
-                            .background(Color(red: 1, green: 0.88, blue: 0.9))
-                            .clipShape(RoundedRectangle(cornerRadius: PageHeaderStyle.badgeCornerRadius(for: metrics)))
+                PageHeader(
+                    title: "衣橱分析",
+                    badge: "STATS",
+                    titleAccessory: { EmptyView() },
+                    metrics: metrics,
+                    actions: {
+                        HStack(spacing: metrics.value(8)) {
+                            HeaderCapsuleButton(title: "刷新", icon: "arrow.clockwise", filled: true, metrics: metrics)
+                                .onTapGesture {}
+                            HeaderCapsuleButton(title: "AI", icon: "sparkles", metrics: metrics)
+                                .onTapGesture { showingAISheet = true }
+                        }
                     }
-
-                    Spacer(minLength: metrics.value(8))
-
-                    HStack(spacing: metrics.value(8)) {
-                        AnalyticsHeaderButton(title: "刷新", icon: "arrow.clockwise", filled: true, metrics: metrics)
-                            .onTapGesture {}
-                        AnalyticsHeaderButton(title: "AI", icon: "sparkles", filled: false, metrics: metrics)
-                            .onTapGesture { showingAISheet = true }
-                    }
-                }
-                .frame(minHeight: PageHeaderStyle.minHeight(for: metrics), alignment: .center)
+                )
 
                 // ── Tab Bar ───────────────────────────────────────
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -1515,6 +1469,7 @@ struct AnalyticsScreen: View {
                     }
                     .padding(.horizontal, 2)
                 }
+                .padding(.bottom, PageHeaderStyle.contentBottomSpacing(for: metrics))
 
                 // ── Tab Content ───────────────────────────────────
                 switch selectedTab {
