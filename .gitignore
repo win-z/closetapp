@@ -1,0 +1,4 @@
+Config/Secrets.xcconfig
+Config/Server.env
+.DerivedData/
+.DS_Store

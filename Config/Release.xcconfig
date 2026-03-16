@@ -1,0 +1,8 @@
+#include "Base.xcconfig"
+#include? "Secrets.xcconfig"
+
+API_BASE_URL = https://101.37.159.90:3000
+DOUBAO_API_URL = https://ark.cn-beijing.volces.com/api/v3
+DOUBAO_MODEL = doubao-seedream-4-5-251128
+SILICONFLOW_API_URL = https://api.siliconflow.cn/v1
+SILICONFLOW_VISION_MODEL = Qwen/Qwen2.5-VL-32B-Instruct
