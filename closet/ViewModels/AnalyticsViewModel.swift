@@ -47,37 +47,18 @@ final class AnalyticsViewModel: ObservableObject {
         }
     }
 
-    func runAIAnalysis() async {
+    func runAIAnalysis(_ input: WardrobeAnalysisInput) async {
         isAnalyzing = true
         defer { isAnalyzing = false }
 
         do {
-            let response = try await service.analyzeWardrobe()
-            aiAnalysisText = Self.extractAnalysisText(from: response) ?? "AI 已返回结果，但当前字段未匹配成功。"
+            let response = try await service.analyzeWardrobe(input)
+            aiAnalysisText = response
             lastUpdatedAt = .now
             cache.save(summary: summary, aiAnalysisText: aiAnalysisText, lastUpdatedAt: lastUpdatedAt)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-
-    private static func extractAnalysisText(from value: JSONValue) -> String? {
-        switch value {
-        case let .string(text):
-            return text
-        case let .object(object):
-            let preferredKeys = ["analysis", "result", "message", "content", "text"]
-            for key in preferredKeys {
-                if let text = object[key]?.stringValue, !text.isEmpty {
-                    return text
-                }
-            }
-            return object.values.compactMap(\.stringValue).first
-        case let .array(array):
-            return array.compactMap(\.stringValue).joined(separator: "\n")
-        default:
-            return nil
         }
     }
 }

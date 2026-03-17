@@ -19,6 +19,7 @@ enum AppEnvironment {
         let doubaoModel: String
         let siliconFlowAPIURL: URL
         let siliconFlowAPIKey: String
+        let siliconFlowTextModel: String
         let siliconFlowVisionModel: String
         let appName: String
 
@@ -55,6 +56,9 @@ enum AppEnvironment {
 
             let configuredSiliconFlowAPIKey = Bundle.main.object(forInfoDictionaryKey: "SILICONFLOW_API_KEY") as? String
             siliconFlowAPIKey = configuredSiliconFlowAPIKey?.nilIfBlank ?? ""
+
+            let configuredSiliconFlowTextModel = Bundle.main.object(forInfoDictionaryKey: "SILICONFLOW_MODEL") as? String
+            siliconFlowTextModel = configuredSiliconFlowTextModel?.nilIfBlank ?? "Qwen/Qwen2.5-72B-Instruct-128K"
 
             let configuredSiliconFlowVisionModel = Bundle.main.object(forInfoDictionaryKey: "SILICONFLOW_VISION_MODEL") as? String
             siliconFlowVisionModel = configuredSiliconFlowVisionModel?.nilIfBlank ?? "Qwen/Qwen2.5-VL-32B-Instruct"

@@ -86,7 +86,7 @@ struct WardrobeScreen: View {
         let source = showingArchivedOnly ? store.archivedWardrobeItems : store.activeWardrobeItems
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return source.filter { item in
-            let matchesFilter = selectedFilter == .all || selectedFilter == item.section.filter
+            let matchesFilter = item.matches(filter: selectedFilter)
             let matchesColor = selectedColor == "全部颜色" || item.color == selectedColor
             let matchesBrand = selectedBrand == "全部品牌" || item.brand == selectedBrand
             let matchesWear: Bool
@@ -98,12 +98,7 @@ struct WardrobeScreen: View {
             case .worn:
                 matchesWear = item.wearCount > 0
             }
-            let haystack = [
-                item.name,
-                item.color,
-                item.brand
-            ].joined(separator: " ").lowercased()
-            let matchesQuery = query.isEmpty || haystack.contains(query)
+            let matchesQuery = query.isEmpty || item.wardrobeSearchText.contains(query)
             return matchesFilter && matchesQuery && matchesColor && matchesBrand && matchesWear
         }
         .sorted(by: sortOption.comparator(store: store))
@@ -288,7 +283,7 @@ struct WardrobeScreen: View {
                         }
                     )
 
-                SearchBar(text: $searchText, placeholder: "搜索名称、颜色、品牌...", metrics: metrics)
+                SearchBar(text: $searchText, placeholder: "搜索名称、颜色、品牌、风格、版型...", metrics: metrics)
                     .padding(.top, PageHeaderStyle.contentTopSpacing(for: metrics))
 
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -481,23 +476,25 @@ struct WardrobeScreen: View {
                         isSavingOutfit = true
                         outfitSaveErrorMessage = nil
                         Task {
-                            do {
-                                let savedOutfit = try await store.saveManualOutfitWithGeneratedCover(itemIDs: orderedIDs)
-                                await MainActor.run {
-                                    if savedOutfit != nil {
-                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
-                                            isOutfitMode = false
-                                            selectedOutfitItemIDs.removeAll()
-                                        }
-                                        appViewModel.selectedTab = .stylist
+                            let savedOutfit = await MainActor.run {
+                                store.saveManualOutfitAndQueueTryOn(itemIDs: orderedIDs)
+                            }
+                            if let savedOutfit {
+                                Task {
+                                    await store.generateQueuedTryOnCover(for: savedOutfit.id)
+                                }
+                            }
+                            await MainActor.run {
+                                if savedOutfit != nil {
+                                    withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                                        isOutfitMode = false
+                                        selectedOutfitItemIDs.removeAll()
                                     }
-                                    isSavingOutfit = false
+                                    appViewModel.selectedTab = .stylist
+                                } else {
+                                    outfitSaveErrorMessage = "保存搭配失败，请稍后重试。"
                                 }
-                            } catch {
-                                await MainActor.run {
-                                    outfitSaveErrorMessage = error.localizedDescription
-                                    isSavingOutfit = false
-                                }
+                                isSavingOutfit = false
                             }
                         }
                     }
@@ -1071,7 +1068,7 @@ struct StylistScreen: View {
 
     @State private var aiPrompt = ""
     @State private var searchText = ""
-    @State private var selectedFilter: WardrobeFilter = .all
+    @State private var selectedFilter: OutfitSceneFilter = .all
     @State private var showingGenerateSheet = false
     @State private var isGeneratingAIOutfit = false
     @State private var aiGenerationErrorMessage: String?
@@ -1089,12 +1086,12 @@ struct StylistScreen: View {
                         actions: { EmptyView() }
                     )
 
-                    SearchBar(text: $searchText, placeholder: "搜索搭配名称、单品名...", metrics: metrics)
+                    SearchBar(text: $searchText, placeholder: "搜索场景、风格、标签、单品名...", metrics: metrics)
                         .padding(.top, PageHeaderStyle.contentTopSpacing(for: metrics))
 
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: metrics.value(8)) {
-                            ForEach([WardrobeFilter.all, .top, .bottom, .shoes, .dress, .uncategorized], id: \.id) { filter in
+                            ForEach(OutfitSceneFilter.allCases, id: \.id) { filter in
                                 FilterChip(
                                     title: filter.rawValue,
                                     selected: filter == selectedFilter,
@@ -1219,7 +1216,7 @@ struct StylistScreen: View {
 private struct SavedOutfitsGrid: View {
     @ObservedObject var store: ClosetStore
     let metrics: LayoutMetrics
-    let selectedFilter: WardrobeFilter
+    let selectedFilter: OutfitSceneFilter
     let searchText: String
 
     @State private var selectedLook: OutfitPreview?
@@ -1235,8 +1232,8 @@ private struct SavedOutfitsGrid: View {
 
         return store.activeSavedLooks.compactMap { look in
             let linkedItems = look.itemIDs.compactMap { activeItemMap[$0] }
-            let primaryFilter = primaryFilter(for: linkedItems)
-            let matchesFilter = selectedFilter == .all || linkedItems.contains { $0.section.filter == selectedFilter }
+            let primaryFilter = primaryFilter(for: look)
+            let matchesFilter = selectedFilter == .all || primaryFilter == selectedFilter
             let haystack = ([look.title, look.subtitle, look.outfitCategory ?? "", look.aiSummary ?? ""] + look.tags + linkedItems.map(\.name)).joined(separator: " ").lowercased()
             let matchesQuery = query.isEmpty || haystack.contains(query)
             guard matchesFilter && matchesQuery else { return nil }
@@ -1244,8 +1241,8 @@ private struct SavedOutfitsGrid: View {
         }
     }
 
-    private var groupedLooks: [(section: WardrobeFilter, looks: [LookContext])] {
-        let order: [WardrobeFilter] = [.top, .bottom, .shoes, .dress, .uncategorized]
+    private var groupedLooks: [(section: OutfitSceneFilter, looks: [LookContext])] {
+        let order: [OutfitSceneFilter] = OutfitSceneFilter.allCases.filter { $0 != .all }
         let grouped = Dictionary(grouping: lookContexts, by: \.primaryFilter)
         return order.compactMap { filter in
             guard let looks = grouped[filter], !looks.isEmpty else { return nil }
@@ -1321,19 +1318,14 @@ private struct SavedOutfitsGrid: View {
         }
     }
 
-    private func primaryFilter(for linkedItems: [ClosetItem]) -> WardrobeFilter {
-        let filters = Set(linkedItems.map { $0.section.filter })
-        if filters.contains(.top) { return .top }
-        if filters.contains(.bottom) { return .bottom }
-        if filters.contains(.shoes) { return .shoes }
-        if filters.contains(.dress) { return .dress }
-        return .uncategorized
+    private func primaryFilter(for look: OutfitPreview) -> OutfitSceneFilter {
+        OutfitSceneFilter.from(category: look.outfitCategory)
     }
 
     private struct LookContext: Identifiable {
         let look: OutfitPreview
         let linkedItems: [ClosetItem]
-        let primaryFilter: WardrobeFilter
+        let primaryFilter: OutfitSceneFilter
 
         var id: UUID { look.id }
     }
@@ -1398,13 +1390,7 @@ struct CalendarScreen: View {
                     badge: "OOTD",
                     titleAccessory: { EmptyView() },
                     metrics: metrics,
-                    actions: {
-                        HeaderCapsuleButton(title: "记录", icon: "plus", metrics: metrics)
-                            .onTapGesture {
-                                selectedDate = calendar.startOfDay(for: .now)
-                                isEditingDiary = true
-                            }
-                    }
+                    actions: { EmptyView() }
                 )
 
                 FrostedCard(padding: 0) {
@@ -1556,6 +1542,60 @@ struct AnalyticsScreen: View {
         (title: "穿着",  icon: "tshirt")
     ]
 
+    private var localAnalysisProfile: WardrobeAnalysisProfile {
+        WardrobeAnalysisProfile(
+            name: store.profile.name,
+            heightCm: store.profile.heightCm,
+            weightKg: store.profile.weightKg
+        )
+    }
+
+    private var remoteAnalysisProfile: WardrobeAnalysisProfile {
+        let profile = appViewModel.profileViewModel.profile
+        return WardrobeAnalysisProfile(
+            name: profile?.name ?? store.profile.name,
+            heightCm: Int(profile?.heightCm ?? Double(store.profile.heightCm)),
+            weightKg: Int(profile?.weightKg ?? Double(store.profile.weightKg))
+        )
+    }
+
+    private var analysisProfile: WardrobeAnalysisProfile {
+        appViewModel.authState == .signedIn ? remoteAnalysisProfile : localAnalysisProfile
+    }
+
+    private var analysisWeather: WardrobeAnalysisWeather {
+        WardrobeAnalysisWeather(
+            location: store.weather.location,
+            temperature: store.weather.temperature,
+            feelsLike: store.weather.feelsLike,
+            humidity: store.weather.humidity,
+            condition: store.weather.condition
+        )
+    }
+
+    private var analysisInput: WardrobeAnalysisInput {
+        WardrobeAnalysisInput(
+            generatedAt: .now,
+            closetName: store.currentClosetName,
+            itemCount: analyticsSourceItems.count,
+            profile: analysisProfile,
+            weather: analysisWeather,
+            items: analyticsSourceItems.map { item in
+                WardrobeAnalysisItem(
+                    name: item.name,
+                    category: item.section.rawValue,
+                    color: item.color,
+                    brand: item.brand,
+                    price: item.price,
+                    wearCount: item.wearCount,
+                    archived: item.isArchived,
+                    createdAt: item.createdAt,
+                    aiAnalysis: WardrobeAnalysisItemAI(analysis: item.aiAnalysis)
+                )
+            }
+        )
+    }
+
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: metrics.value(14)) {
@@ -1565,14 +1605,7 @@ struct AnalyticsScreen: View {
                     badge: "STATS",
                     titleAccessory: { EmptyView() },
                     metrics: metrics,
-                    actions: {
-                        HStack(spacing: metrics.value(8)) {
-                            HeaderCapsuleButton(title: "刷新", icon: "arrow.clockwise", filled: true, metrics: metrics)
-                                .onTapGesture {}
-                            HeaderCapsuleButton(title: "AI", icon: "sparkles", metrics: metrics)
-                                .onTapGesture { showingAISheet = true }
-                        }
-                    }
+                    actions: { EmptyView() }
                 )
 
                 // ── Tab Bar ───────────────────────────────────────
@@ -1598,7 +1631,14 @@ struct AnalyticsScreen: View {
 
                 // ── Tab Content ───────────────────────────────────
                 switch selectedTab {
-                case 0: AnalyticsOverviewTab(store: store, viewModel: viewModel, items: analyticsSourceItems, metrics: metrics, onAITap: { showingAISheet = true })
+                case 0: AnalyticsOverviewTab(
+                    store: store,
+                    viewModel: viewModel,
+                    items: analyticsSourceItems,
+                    metrics: metrics,
+                    onOpenReport: presentAISheet,
+                    onRefreshAnalysis: runAnalysisInBackground
+                )
                 case 1: AnalyticsBrandTab(items: analyticsSourceItems, metrics: metrics)
                 case 2: AnalyticsPriceTab(items: analyticsSourceItems, metrics: metrics)
                 case 3: AnalyticsWearTab(store: store, items: analyticsSourceItems, metrics: metrics)
@@ -1624,12 +1664,23 @@ struct AnalyticsScreen: View {
                 brand: item.brand ?? "未填写品牌",
                 price: Int(item.price ?? 0),
                 wearCount: item.wearCount,
-                gradientName: WardrobeSection(category: item.category).defaultGradientName
+                gradientName: WardrobeSection(category: item.category).defaultGradientName,
+                aiAnalysis: item.aiAnalysis ?? .empty
             )
         }
     }
     private var analyticsSourceItems: [ClosetItem] {
         appViewModel.authState == .signedIn ? remoteWardrobeItems : store.activeWardrobeItems
+    }
+
+    private func presentAISheet() {
+        showingAISheet = true
+    }
+
+    private func runAnalysisInBackground() {
+        Task {
+            await viewModel.runAIAnalysis(analysisInput)
+        }
     }
 }
 
@@ -1639,7 +1690,8 @@ private struct AnalyticsOverviewTab: View {
     @ObservedObject var viewModel: AnalyticsViewModel
     let items: [ClosetItem]
     let metrics: LayoutMetrics
-    var onAITap: () -> Void
+    var onOpenReport: () -> Void
+    var onRefreshAnalysis: () -> Void
 
     var body: some View {
         VStack(spacing: metrics.value(16)) {
@@ -1658,17 +1710,17 @@ private struct AnalyticsOverviewTab: View {
                         Image(systemName: "sparkles")
                             .font(.system(size: metrics.value(22), weight: .bold))
                             .foregroundStyle(.white.opacity(0.9))
-                        Text("深度报告已就绪")
+                        Text(viewModel.isAnalyzing ? "深度报告更新中" : "深度报告已就绪")
                             .font(.system(size: metrics.value(18), weight: .heavy))
                             .foregroundStyle(.white)
                     }
-                    Text("AI 已根据您的衣橱数据生成了专业的风格建议与健康度报告。")
+                    Text(viewModel.isAnalyzing ? "正在后台分析当前衣橱，你可以继续浏览其他内容，稍后进入深度报告查看最新结果。" : "AI 已根据您的衣橱数据生成了专业的风格建议与健康度报告。")
                         .font(.system(size: metrics.value(13), weight: .medium))
                         .foregroundStyle(.white.opacity(0.82))
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: metrics.value(10)) {
                         Button {
-                            onAITap()
+                            onOpenReport()
                         } label: {
                             Text("查看深度报告")
                                 .font(.system(size: metrics.value(13.5), weight: .bold))
@@ -1678,16 +1730,33 @@ private struct AnalyticsOverviewTab: View {
                                 .background(.white)
                                 .clipShape(Capsule())
                         }
-                        Button {
-                            onAITap()
-                        } label: {
-                            Text("更新分析")
-                                .font(.system(size: metrics.value(13.5), weight: .bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, metrics.value(16))
-                                .padding(.vertical, metrics.value(9))
-                                .background(.white.opacity(0.2))
-                                .clipShape(Capsule())
+
+                        if viewModel.isAnalyzing {
+                            HStack(spacing: metrics.value(8)) {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .tint(.white)
+                                    .scaleEffect(0.85)
+                                Text("正在分析")
+                                    .font(.system(size: metrics.value(13.5), weight: .bold))
+                                    .foregroundStyle(.white)
+                            }
+                            .padding(.horizontal, metrics.value(16))
+                            .padding(.vertical, metrics.value(9))
+                            .background(.white.opacity(0.2))
+                            .clipShape(Capsule())
+                        } else {
+                            Button {
+                                onRefreshAnalysis()
+                            } label: {
+                                Text("更新分析")
+                                    .font(.system(size: metrics.value(13.5), weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, metrics.value(16))
+                                    .padding(.vertical, metrics.value(9))
+                                    .background(.white.opacity(0.2))
+                                    .clipShape(Capsule())
+                            }
                         }
                     }
                 }
@@ -2125,13 +2194,23 @@ private struct AIDeepAnalysisSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private let sectionColors: [Color] = [
-        Color(hue: 0.14, saturation: 0.3, brightness: 0.98),
-        Color(hue: 0.58, saturation: 0.18, brightness: 0.97),
-        Color(hue: 0.42, saturation: 0.2, brightness: 0.97),
-        Color(hue: 0.71, saturation: 0.18, brightness: 0.97)
+        Color(red: 0.97, green: 0.92, blue: 0.84),
+        Color(red: 0.89, green: 0.92, blue: 0.97),
+        Color(red: 0.88, green: 0.95, blue: 0.90),
+        Color(red: 0.92, green: 0.89, blue: 0.97)
     ]
-    private let sectionIcons = ["lightbulb", "arrow.up.right", "checkmark.circle", "star"]
-    private let sectionIconColors: [Color] = [Color.orange, ClosetTheme.indigo, ClosetTheme.mint, ClosetTheme.rose]
+    private let sectionIcons = ["scope", "heart.text.square", "shippingbox", "sparkles", "clock.arrow.circlepath"]
+    private let sectionIconColors: [Color] = [
+        Color(red: 0.78, green: 0.46, blue: 0.19),
+        Color(red: 0.24, green: 0.42, blue: 0.71),
+        Color(red: 0.22, green: 0.58, blue: 0.44),
+        Color(red: 0.57, green: 0.38, blue: 0.78),
+        Color(red: 0.72, green: 0.47, blue: 0.28)
+    ]
+    private let reportBackground = Color(red: 0.98, green: 0.97, blue: 0.95)
+    private let inkColor = Color(red: 0.13, green: 0.16, blue: 0.24)
+    private let mutedInkColor = Color(red: 0.42, green: 0.45, blue: 0.53)
+    private let cardBorderColor = Color.black.opacity(0.06)
 
     // Split the AI text into sections by "建议" markers
     private var sections: [(title: String, body: String, color: Color, icon: String, iconColor: Color)] {
@@ -2168,106 +2247,325 @@ private struct AIDeepAnalysisSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Handle bar
-            Capsule().fill(Color.secondary.opacity(0.3))
-                .frame(width: 36, height: 5).padding(.top, 12).padding(.bottom, 8)
+            VStack(spacing: metrics.value(16)) {
+                Capsule()
+                    .fill(Color.black.opacity(0.12))
+                    .frame(width: 40, height: 5)
+                    .padding(.top, 12)
 
-            // Sheet header
-            HStack(spacing: metrics.value(12)) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: metrics.value(10))
-                        .fill(ClosetTheme.accentGradient)
-                        .frame(width: metrics.value(40), height: metrics.value(40))
-                    Image(systemName: "sparkles")
-                        .font(.system(size: metrics.value(18), weight: .bold))
-                        .foregroundStyle(.white)
+                HStack(alignment: .top, spacing: metrics.value(14)) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: metrics.value(18), style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 0.16, green: 0.17, blue: 0.28),
+                                        Color(red: 0.52, green: 0.39, blue: 0.82),
+                                        Color(red: 0.93, green: 0.73, blue: 0.47)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: metrics.value(52), height: metrics.value(64))
+                        Image(systemName: "sparkles")
+                            .font(.system(size: metrics.value(24), weight: .medium))
+                            .foregroundStyle(.white)
+                    }
+                    VStack(alignment: .leading, spacing: metrics.value(6)) {
+                        Text("AI 衣橱深度分析")
+                            .font(.system(size: metrics.value(22), weight: .heavy))
+                            .foregroundStyle(inkColor)
+                        Text("Wardrobe Editorial Report")
+                            .font(.system(size: metrics.value(11), weight: .semibold))
+                            .foregroundStyle(mutedInkColor.opacity(0.8))
+                            .tracking(1.2)
+                        Text("从风格定位、衣橱健康到购买补强，把建议整理成一份更适合阅读和回看的长报告。")
+                            .font(.system(size: metrics.value(13), weight: .medium))
+                            .foregroundStyle(mutedInkColor)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: metrics.value(14), weight: .semibold))
+                            .foregroundStyle(mutedInkColor)
+                            .frame(width: metrics.value(36), height: metrics.value(36))
+                            .background(Color.white.opacity(0.75))
+                            .clipShape(Circle())
+                            .overlay(Circle().strokeBorder(Color.black.opacity(0.06), lineWidth: 1))
+                    }
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("AI 衣橱深度分析")
-                        .font(.system(size: metrics.value(16), weight: .bold))
-                        .foregroundStyle(ClosetTheme.textPrimary)
-                    Text("基于您的实时衣橱数据生成")
-                        .font(.system(size: metrics.value(12), weight: .medium))
-                        .foregroundStyle(ClosetTheme.textSecondary)
+                .padding(.horizontal, metrics.value(20))
+
+                HStack(spacing: metrics.value(10)) {
+                    reportMetaPill(title: "Live Data", value: "实时衣橱")
+                    reportMetaPill(title: "Model", value: "Qwen 128K")
+                    if let updatedAt = viewModel.lastUpdatedAt {
+                        reportMetaPill(title: "Updated", value: reportDate(updatedAt))
+                    }
                 }
-                Spacer()
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: metrics.value(14), weight: .semibold))
-                        .foregroundStyle(ClosetTheme.textSecondary)
-                        .padding(metrics.value(8))
-                        .background(ClosetTheme.secondaryCard)
-                        .clipShape(Circle())
-                }
+                .padding(.horizontal, metrics.value(20))
+                .padding(.bottom, metrics.value(4))
             }
-            .padding(.horizontal, metrics.value(20))
-            .padding(.bottom, metrics.value(16))
 
             Divider()
 
-            if let text = viewModel.aiAnalysisText?.nilIfBlank {
+            if viewModel.isAnalyzing, let text = viewModel.aiAnalysisText?.nilIfBlank {
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: metrics.value(12)) {
-                        if sections.isEmpty {
-                            // Fallback: show raw text
-                            FrostedCard {
-                                Text(text)
-                                    .font(.system(size: metrics.value(14), weight: .medium))
-                                    .foregroundStyle(ClosetTheme.textSecondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        } else {
-                            ForEach(sections.indices, id: \.self) { idx in
-                                let s = sections[idx]
-                                VStack(alignment: .leading, spacing: metrics.value(10)) {
-                                    HStack(spacing: metrics.value(8)) {
-                                        Image(systemName: s.icon)
-                                            .font(.system(size: metrics.value(14), weight: .bold))
-                                            .foregroundStyle(s.iconColor)
-                                        Text(s.title)
-                                            .font(.system(size: metrics.value(15), weight: .bold))
-                                            .foregroundStyle(ClosetTheme.textPrimary)
-                                    }
-                                    .padding(metrics.value(14))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(s.color)
-                                    .clipShape(RoundedRectangle(cornerRadius: metrics.value(14)))
-
-                                    if !s.body.isEmpty {
-                                        Text(s.body)
-                                            .font(.system(size: metrics.value(14), weight: .regular))
-                                            .foregroundStyle(ClosetTheme.textSecondary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .padding(metrics.value(14))
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .background(s.color.opacity(0.5))
-                                            .clipShape(RoundedRectangle(cornerRadius: metrics.value(14)))
-                                    }
-                                }
-                            }
-                        }
+                        reportStatusBanner(
+                            icon: "clock.arrow.circlepath",
+                            title: "后台正在更新分析",
+                            subtitle: "你现在看到的是最近一次完成的报告，新的结果生成后会自动覆盖。"
+                        )
+                        reportContent(for: text)
                     }
                     .padding(metrics.value(20))
                 }
+            } else if viewModel.isAnalyzing {
+                VStack(spacing: metrics.value(16)) {
+                    Spacer()
+                    ZStack {
+                        Circle()
+                            .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                            .frame(width: metrics.value(74), height: metrics.value(74))
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .scaleEffect(1.25)
+                    }
+                    Text("正在生成新一版深度报告")
+                        .font(.system(size: metrics.value(18), weight: .bold))
+                        .foregroundStyle(inkColor)
+                    Text("系统正在结合你当前的衣橱结构、颜色分布、穿着次数和价格信息，整理一份更完整的建议。")
+                        .font(.system(size: metrics.value(13.5), weight: .medium))
+                        .foregroundStyle(mutedInkColor)
+                        .multilineTextAlignment(.center)
+                    Spacer()
+                }
+                .padding(metrics.value(28))
+            } else if let text = viewModel.aiAnalysisText?.nilIfBlank {
+                ScrollView(showsIndicators: false) {
+                    reportContent(for: text)
+                        .padding(metrics.value(20))
+                }
+            } else if let errorMessage = viewModel.errorMessage?.nilIfBlank {
+                VStack(spacing: metrics.value(16)) {
+                    Spacer()
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 36, weight: .regular))
+                        .foregroundStyle(ClosetTheme.rose)
+                    Text("分析暂时失败")
+                        .font(.system(size: metrics.value(16), weight: .medium))
+                        .foregroundStyle(inkColor)
+                    Text(errorMessage)
+                        .font(.system(size: metrics.value(13)))
+                        .foregroundStyle(mutedInkColor)
+                        .multilineTextAlignment(.center)
+                    Spacer()
+                }
+                .padding(metrics.value(20))
             } else {
                 VStack(spacing: metrics.value(16)) {
                     Spacer()
                     Image(systemName: "sparkles")
                         .font(.system(size: 40, weight: .thin))
-                        .foregroundStyle(ClosetTheme.textSecondary.opacity(0.3))
+                        .foregroundStyle(mutedInkColor.opacity(0.35))
                     Text("还没有 AI 分析报告")
                         .font(.system(size: metrics.value(16), weight: .medium))
-                        .foregroundStyle(ClosetTheme.textSecondary.opacity(0.6))
-                    Text("返回分析页点击「AI 分析」按钮生成报告")
+                        .foregroundStyle(mutedInkColor)
+                    Text("返回分析页点击「更新分析」生成第一份深度报告")
                         .font(.system(size: metrics.value(13)))
-                        .foregroundStyle(ClosetTheme.textSecondary.opacity(0.4))
+                        .foregroundStyle(mutedInkColor.opacity(0.8))
                         .multilineTextAlignment(.center)
                     Spacer()
                 }
                 .padding(metrics.value(20))
             }
         }
-        .background(Color(UIColor.systemBackground))
+        .background(reportBackground)
+    }
+
+    @ViewBuilder
+    private func reportContent(for text: String) -> some View {
+        VStack(alignment: .leading, spacing: metrics.value(14)) {
+            reportLeadCard
+
+            if sections.isEmpty {
+                reportRawCard(text)
+            } else {
+                ForEach(sections.indices, id: \.self) { idx in
+                    let section = sections[idx]
+                    reportSectionCard(section: section, index: idx)
+                }
+            }
+        }
+    }
+
+    private var reportLeadCard: some View {
+        VStack(alignment: .leading, spacing: metrics.value(12)) {
+            Text("Report Summary")
+                .font(.system(size: metrics.value(11), weight: .bold))
+                .foregroundStyle(mutedInkColor.opacity(0.85))
+                .tracking(1.1)
+            HStack(alignment: .top, spacing: metrics.value(12)) {
+                Text("AI")
+                    .font(.system(size: metrics.value(28), weight: .black))
+                    .foregroundStyle(inkColor.opacity(0.14))
+                VStack(alignment: .leading, spacing: metrics.value(8)) {
+                    Text("这份报告会把建议拆成多个章节，适合快速浏览，也适合之后回来看重点。")
+                        .font(.system(size: metrics.value(15), weight: .semibold))
+                        .foregroundStyle(inkColor)
+                    Text("重点会放在风格方向、重复购买、低频闲置和下一步最值得补的单品上。")
+                        .font(.system(size: metrics.value(13), weight: .medium))
+                        .foregroundStyle(mutedInkColor)
+                }
+            }
+        }
+        .padding(metrics.value(18))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.82))
+        .clipShape(RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous)
+                .stroke(cardBorderColor, lineWidth: 1)
+        )
+    }
+
+    private func reportRawCard(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: metrics.value(10)) {
+            Text("完整内容")
+                .font(.system(size: metrics.value(12), weight: .bold))
+                .foregroundStyle(mutedInkColor)
+            Text(text)
+                .font(.system(size: metrics.value(15), weight: .medium))
+                .foregroundStyle(inkColor)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(metrics.value(18))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.82))
+        .clipShape(RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous)
+                .stroke(cardBorderColor, lineWidth: 1)
+        )
+    }
+
+    private func reportSectionCard(
+        section: (title: String, body: String, color: Color, icon: String, iconColor: Color),
+        index: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: metrics.value(14)) {
+            HStack(alignment: .center, spacing: metrics.value(12)) {
+                ZStack {
+                    Circle()
+                        .fill(section.color)
+                        .frame(width: metrics.value(42), height: metrics.value(42))
+                    Image(systemName: section.icon)
+                        .font(.system(size: metrics.value(16), weight: .bold))
+                        .foregroundStyle(section.iconColor)
+                }
+                VStack(alignment: .leading, spacing: metrics.value(3)) {
+                    Text("SECTION \(index + 1)")
+                        .font(.system(size: metrics.value(10), weight: .bold))
+                        .foregroundStyle(mutedInkColor.opacity(0.75))
+                        .tracking(1.0)
+                    Text(section.title)
+                        .font(.system(size: metrics.value(18), weight: .heavy))
+                        .foregroundStyle(inkColor)
+                }
+                Spacer()
+            }
+
+            Rectangle()
+                .fill(section.color.opacity(0.9))
+                .frame(height: 1)
+
+            Text(formattedBody(section.body))
+                .font(.system(size: metrics.value(15), weight: .medium))
+                .foregroundStyle(inkColor.opacity(0.88))
+                .lineSpacing(metrics.value(5))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(metrics.value(18))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.82))
+        .clipShape(RoundedRectangle(cornerRadius: metrics.value(24), style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: metrics.value(24), style: .continuous)
+                .stroke(cardBorderColor, lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.03), radius: 18, x: 0, y: 10)
+    }
+
+    private func reportStatusBanner(icon: String, title: String, subtitle: String) -> some View {
+        HStack(alignment: .top, spacing: metrics.value(12)) {
+            ZStack {
+                Circle()
+                    .fill(Color.white.opacity(0.88))
+                    .frame(width: metrics.value(34), height: metrics.value(34))
+                Image(systemName: icon)
+                    .font(.system(size: metrics.value(14), weight: .bold))
+                    .foregroundStyle(inkColor)
+            }
+            VStack(alignment: .leading, spacing: metrics.value(4)) {
+                Text(title)
+                    .font(.system(size: metrics.value(14), weight: .bold))
+                    .foregroundStyle(inkColor)
+                Text(subtitle)
+                    .font(.system(size: metrics.value(12.5), weight: .medium))
+                    .foregroundStyle(mutedInkColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(metrics.value(16))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.93, green: 0.90, blue: 0.84),
+                    Color(red: 0.96, green: 0.94, blue: 0.90)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: metrics.value(20), style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: metrics.value(20), style: .continuous)
+                .stroke(cardBorderColor, lineWidth: 1)
+        )
+    }
+
+    private func reportMetaPill(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title.uppercased())
+                .font(.system(size: metrics.value(9), weight: .bold))
+                .foregroundStyle(mutedInkColor.opacity(0.7))
+            Text(value)
+                .font(.system(size: metrics.value(12), weight: .semibold))
+                .foregroundStyle(inkColor)
+        }
+        .padding(.horizontal, metrics.value(12))
+        .padding(.vertical, metrics.value(8))
+        .background(Color.white.opacity(0.76))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(cardBorderColor, lineWidth: 1))
+    }
+
+    private func reportDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from: date)
+    }
+
+    private func formattedBody(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "###", with: "")
     }
 }
 
@@ -3473,6 +3771,18 @@ struct OutfitLookCard: View {
                         onDelete: onDeleteRequest
                     )
                     .padding(metrics.value(8))
+
+                    if look.isGeneratingTryOn {
+                        Text("AI图生成中")
+                            .font(.system(size: metrics.value(10), weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, metrics.value(8))
+                            .frame(height: metrics.value(24))
+                            .background(ClosetTheme.accentGradient)
+                            .clipShape(Capsule())
+                            .padding(.top, metrics.value(8))
+                            .padding(.trailing, metrics.value(8))
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: metrics.value(2)) {
@@ -3586,20 +3896,7 @@ private struct OutfitPreviewThumbnail: View {
 
     private var normalizedLayouts: [OutfitItemLayout] {
         if !look.itemLayouts.isEmpty { return look.itemLayouts }
-        return linkedItems.enumerated().map { index, item in
-            switch item.section {
-            case .top:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.19, scale: integrated ? 1.12 : 1.0, rotation: 0)
-            case .bottom:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.54, scale: integrated ? 1.04 : 0.94, rotation: 0)
-            case .dress:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.4, scale: integrated ? 1.16 : 1.04, rotation: 0)
-            case .shoes:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.84, scale: integrated ? 0.98 : 0.86, rotation: 0)
-            case .uncategorized:
-                return OutfitItemLayout(itemID: item.id, x: index.isMultiple(of: 2) ? 0.32 : 0.68, y: 0.55, scale: integrated ? 0.96 : 0.84, rotation: 0)
-            }
-        }
+        return defaultCurtainLayouts(for: linkedItems, integrated: integrated)
     }
 }
 
@@ -3643,6 +3940,146 @@ private struct RevealDeleteControl: View {
     }
 }
 
+private func defaultCurtainLayouts(for items: [ClosetItem], integrated: Bool) -> [OutfitItemLayout] {
+    let topItems = items.filter { $0.section == .top }
+    let bottomItems = items.filter { $0.section == .bottom }
+    let dressItems = items.filter { $0.section == .dress }
+    let shoeItems = items.filter { $0.section == .shoes }
+    let accessoryItems = items.filter { $0.section == .uncategorized }
+
+    var layouts: [OutfitItemLayout] = []
+
+    if let dress = dressItems.first {
+        layouts.append(
+            OutfitItemLayout(
+                itemID: dress.id,
+                x: 0.26,
+                y: 0.44,
+                scale: integrated ? 1.34 : 1.26,
+                rotation: 0
+            )
+        )
+    } else {
+        if let top = topItems.first {
+            layouts.append(
+                OutfitItemLayout(
+                    itemID: top.id,
+                    x: 0.26,
+                    y: 0.22,
+                    scale: integrated ? 1.14 : 1.08,
+                    rotation: 0
+                )
+            )
+        }
+        if let bottom = bottomItems.first {
+            layouts.append(
+                OutfitItemLayout(
+                    itemID: bottom.id,
+                    x: 0.26,
+                    y: 0.66,
+                    scale: integrated ? 1.12 : 1.06,
+                    rotation: 0
+                )
+            )
+        }
+    }
+
+    let accessoryGroups = Dictionary(grouping: accessoryItems, by: accessoryLayoutKind(for:))
+    if let hat = accessoryGroups[.hat]?.first {
+        layouts.append(
+            OutfitItemLayout(
+                itemID: hat.id,
+                x: 0.77,
+                y: 0.16,
+                scale: integrated ? 0.76 : 0.7,
+                rotation: 0
+            )
+        )
+    }
+    if let bag = accessoryGroups[.bag]?.first {
+        layouts.append(
+            OutfitItemLayout(
+                itemID: bag.id,
+                x: 0.71,
+                y: 0.30,
+                scale: integrated ? 0.92 : 0.84,
+                rotation: 0
+            )
+        )
+    }
+    if let accessory = accessoryGroups[.accessory]?.first {
+        layouts.append(
+            OutfitItemLayout(
+                itemID: accessory.id,
+                x: 0.82,
+                y: 0.42,
+                scale: integrated ? 0.68 : 0.62,
+                rotation: 0
+            )
+        )
+    }
+
+    if let shoes = shoeItems.first {
+        layouts.append(
+            OutfitItemLayout(
+                itemID: shoes.id,
+                x: 0.73,
+                y: 0.76,
+                scale: integrated ? 0.9 : 0.84,
+                rotation: 0
+            )
+        )
+    }
+
+    let usedIDs = Set(layouts.map(\.itemID))
+    let remainingItems = items.filter { !usedIDs.contains($0.id) }
+    let extraPresets: [(Double, Double, Double)] = [
+        (0.73, 0.40, integrated ? 0.82 : 0.76),
+        (0.73, 0.56, integrated ? 0.82 : 0.76),
+        (0.73, 0.88, integrated ? 0.78 : 0.72),
+        (0.26, 0.88, integrated ? 0.84 : 0.78)
+    ]
+
+    for (index, item) in remainingItems.enumerated() {
+        let preset = extraPresets[min(index, extraPresets.count - 1)]
+        layouts.append(
+            OutfitItemLayout(
+                itemID: item.id,
+                x: preset.0,
+                y: preset.1,
+                scale: preset.2,
+                rotation: 0
+            )
+        )
+    }
+
+    return items.compactMap { item in
+        layouts.first(where: { $0.itemID == item.id })
+    }
+}
+
+private func accessoryLayoutKind(for item: ClosetItem) -> AccessoryLayoutKind {
+    let source = [item.name, item.color, item.brand, item.aiAnalysis.pattern ?? "", item.aiAnalysis.silhouette ?? ""]
+        .joined(separator: " ")
+        .lowercased()
+
+    if source.contains("帽") || source.contains("cap") || source.contains("hat") || source.contains("beanie") {
+        return .hat
+    }
+
+    if source.contains("包") || source.contains("bag") || source.contains("tote") || source.contains("backpack") || source.contains("handbag") || source.contains("斜挎") || source.contains("双肩") {
+        return .bag
+    }
+
+    return .accessory
+}
+
+private enum AccessoryLayoutKind {
+    case hat
+    case bag
+    case accessory
+}
+
 struct OutfitDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: ClosetStore
@@ -3655,6 +4092,7 @@ struct OutfitDetailSheet: View {
     @State private var isShowingRecordCalendar = false
     @State private var recordMonth = Calendar.current.startOfDay(for: .now)
     @State private var selectedRecordDate = Calendar.current.startOfDay(for: .now)
+    @State private var customTagText = ""
 
     private var latestLook: OutfitPreview {
         store.savedLooks.first(where: { $0.id == look.id }) ?? look
@@ -3683,63 +4121,65 @@ struct OutfitDetailSheet: View {
         return pages
     }
 
+    private var suggestedTags: [String] {
+        let aiTags = linkedItems.flatMap { item in
+            item.aiAnalysis.style +
+            item.aiAnalysis.occasions +
+            item.aiAnalysis.seasons +
+            item.aiAnalysis.materials +
+            [item.aiAnalysis.silhouette, item.aiAnalysis.pattern, item.aiAnalysis.formality, item.aiAnalysis.warmth].compactMap { $0 }
+        }
+
+        return ([latestLook.outfitCategory].compactMap { $0 } + latestLook.tags + aiTags).reduce(into: [String]()) { result, tag in
+            let trimmed = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !result.contains(trimmed) else { return }
+            result.append(trimmed)
+        }
+    }
+
     private var resolvedLayouts: [OutfitItemLayout] {
         if !latestLook.itemLayouts.isEmpty {
             return latestLook.itemLayouts
         }
 
-        return linkedItems.enumerated().map { index, item in
-            switch item.section {
-            case .top:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.2, scale: 1.02, rotation: 0)
-            case .bottom:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.53, scale: 0.98, rotation: 0)
-            case .dress:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.42, scale: 1.05, rotation: 0)
-            case .shoes:
-                return OutfitItemLayout(itemID: item.id, x: 0.5, y: 0.8, scale: 0.92, rotation: 0)
-            case .uncategorized:
-                return OutfitItemLayout(itemID: item.id, x: index % 2 == 0 ? 0.3 : 0.7, y: 0.5, scale: 0.92, rotation: 0)
-            }
-        }
+        return defaultCurtainLayouts(for: linkedItems, integrated: false)
     }
 
     var body: some View {
         NavigationStack {
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: metrics.value(14)) {
-                    VStack(alignment: .leading, spacing: metrics.value(4)) {
-                        Text(latestLook.title)
-                            .font(.system(size: metrics.value(24), weight: .heavy))
-                            .foregroundStyle(ClosetTheme.textPrimary)
-                            .padding(.horizontal, metrics.horizontalPadding)
+                VStack(alignment: .leading, spacing: metrics.value(16)) {
+                    FrostedCard(padding: metrics.value(20)) {
+                        VStack(alignment: .leading, spacing: metrics.value(12)) {
+                            Text(latestLook.title)
+                                .font(.system(size: metrics.value(24), weight: .heavy))
+                                .foregroundStyle(ClosetTheme.textPrimary)
+                                .fixedSize(horizontal: false, vertical: true)
 
-                        if let outfitCategory = latestLook.outfitCategory, !outfitCategory.isEmpty {
-                            Text(outfitCategory)
-                                .font(.system(size: metrics.value(13), weight: .semibold))
-                                .foregroundStyle(ClosetTheme.indigo)
-                                .padding(.horizontal, metrics.horizontalPadding)
-                        }
-                    }
-
-                    if !latestLook.tags.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: metrics.value(8)) {
-                                ForEach(latestLook.tags, id: \.self) { tag in
-                                    Text(tag)
-                                        .font(.system(size: metrics.value(11), weight: .semibold))
-                                        .foregroundStyle(ClosetTheme.textPrimary)
-                                        .padding(.horizontal, metrics.value(10))
-                                        .padding(.vertical, metrics.value(6))
-                                        .background(
-                                            Capsule()
-                                                .fill(ClosetTheme.secondaryCard)
-                                        )
+                                if let outfitCategory = latestLook.outfitCategory, !outfitCategory.isEmpty {
+                                    detailMetaChip(outfitCategory, tint: ClosetTheme.indigo.opacity(0.16), textColor: ClosetTheme.indigo)
                                 }
+                                detailMetaChip(latestLook.sourceMode == .ai ? "AI 搭配" : "手动搭配", tint: ClosetTheme.rose.opacity(0.14), textColor: ClosetTheme.rose)
                             }
-                            .padding(.horizontal, metrics.horizontalPadding)
+
+                            Text(latestLook.aiSummary ?? "这套搭配已根据所选单品自动归类并生成标签，方便后续搜索、推荐和试穿展示。")
+                                .font(.system(size: metrics.value(13), weight: .medium))
+                                .foregroundStyle(ClosetTheme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            if latestLook.isGeneratingTryOn {
+                                HStack(spacing: metrics.value(8)) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("AI 试穿图正在后台生成，当前先使用幕布封面。")
+                                        .font(.system(size: metrics.value(12), weight: .medium))
+                                }
+                                .foregroundStyle(ClosetTheme.textSecondary)
+                            }
                         }
                     }
+                    .padding(.horizontal, metrics.horizontalPadding)
 
                     if !linkedItems.isEmpty {
                         TabView(selection: $selectedGalleryPageID) {
@@ -3760,13 +4200,7 @@ struct OutfitDetailSheet: View {
 
                         HStack(spacing: metrics.value(10)) {
                             PhotosPicker(selection: $selectedRealPhotoItem, matching: .images) {
-                                Label("导入真实照片", systemImage: "photo.badge.plus")
-                                    .font(.system(size: metrics.value(12), weight: .semibold))
-                                    .foregroundStyle(ClosetTheme.indigo)
-                                    .padding(.horizontal, metrics.value(12))
-                                    .frame(height: metrics.value(36))
-                                    .background(ClosetTheme.secondaryCard)
-                                    .clipShape(Capsule())
+                                detailActionLabel("导入真实照片", systemImage: "photo.badge.plus", tint: ClosetTheme.indigo)
                             }
 
                             Button {
@@ -3775,13 +4209,7 @@ struct OutfitDetailSheet: View {
                                 recordMonth = today
                                 isShowingRecordCalendar = true
                             } label: {
-                                Label("记录", systemImage: "calendar.badge.plus")
-                                    .font(.system(size: metrics.value(12), weight: .semibold))
-                                    .foregroundStyle(ClosetTheme.textPrimary)
-                                    .padding(.horizontal, metrics.value(12))
-                                    .frame(height: metrics.value(36))
-                                    .background(ClosetTheme.secondaryCard)
-                                    .clipShape(Capsule())
+                                detailActionLabel("记录穿搭", systemImage: "calendar.badge.plus")
                             }
 
                             Menu {
@@ -3798,67 +4226,111 @@ struct OutfitDetailSheet: View {
                                     }
                                 }
                             } label: {
-                                Label("设为封面", systemImage: "photo.on.rectangle")
-                                    .font(.system(size: metrics.value(12), weight: .semibold))
-                                    .foregroundStyle(ClosetTheme.textPrimary)
-                                    .padding(.horizontal, metrics.value(12))
-                                    .frame(height: metrics.value(36))
-                                    .background(ClosetTheme.secondaryCard)
-                                    .clipShape(Capsule())
+                                detailActionLabel("设为封面", systemImage: "photo.on.rectangle")
                             }
                         }
                         .padding(.horizontal, metrics.horizontalPadding)
                     }
 
                     if !linkedItems.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: metrics.value(10)) {
-                                ForEach(linkedItems) { item in
-                                    VStack(alignment: .leading, spacing: metrics.value(6)) {
-                                        MiniGarmentCard(
-                                            symbol: item.symbol,
-                                            gradientName: item.gradientName,
-                                            imageFileName: item.imageFileName,
-                                            metrics: metrics
-                                        )
-                                        .frame(width: metrics.value(64), height: metrics.value(84))
+                        FrostedCard(padding: metrics.value(18)) {
+                            VStack(alignment: .leading, spacing: metrics.value(12)) {
+                                Text("搭配单品")
+                                    .font(.system(size: metrics.value(15), weight: .bold))
+                                    .foregroundStyle(ClosetTheme.textPrimary)
 
-                                        Text(item.name)
-                                            .font(.system(size: metrics.value(10.5), weight: .semibold))
-                                            .foregroundStyle(ClosetTheme.textPrimary)
-                                            .lineLimit(1)
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: metrics.value(12)) {
+                                        ForEach(linkedItems) { item in
+                                            VStack(alignment: .leading, spacing: metrics.value(8)) {
+                                                MiniGarmentCard(
+                                                    symbol: item.symbol,
+                                                    gradientName: item.gradientName,
+                                                    imageFileName: item.imageFileName,
+                                                    metrics: metrics
+                                                )
+                                                .frame(width: metrics.value(74), height: metrics.value(94))
+
+                                                Text(item.name)
+                                                    .font(.system(size: metrics.value(11), weight: .semibold))
+                                                    .foregroundStyle(ClosetTheme.textPrimary)
+                                                    .lineLimit(2)
+                                            }
+                                            .frame(width: metrics.value(74), alignment: .leading)
+                                        }
                                     }
-                                    .frame(width: metrics.value(64), alignment: .leading)
                                 }
                             }
-                            .padding(.horizontal, metrics.horizontalPadding)
                         }
+                        .padding(.horizontal, metrics.horizontalPadding)
                     }
 
                     FrostedCard(padding: metrics.value(18)) {
-                        VStack(alignment: .leading, spacing: metrics.value(8)) {
+                        VStack(alignment: .leading, spacing: metrics.value(10)) {
                             Text("AI 搭配解读")
                                 .font(.system(size: metrics.value(15), weight: .bold))
                                 .foregroundStyle(ClosetTheme.textPrimary)
                             Text(latestLook.aiSummary ?? "这套搭配已根据所选单品自动归类并生成标签，方便后续搜索、推荐和试穿展示。")
                                 .font(.system(size: metrics.value(13), weight: .medium))
                                 .foregroundStyle(ClosetTheme.textSecondary.opacity(0.76))
-                                .lineLimit(4)
                                 .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(.horizontal, metrics.horizontalPadding)
+
+                    FrostedCard(padding: metrics.value(18)) {
+                        VStack(alignment: .leading, spacing: metrics.value(12)) {
+                            HStack {
+                                Text("标签选择")
+                                    .font(.system(size: metrics.value(15), weight: .bold))
+                                    .foregroundStyle(ClosetTheme.textPrimary)
+                                Spacer()
+                                Text("用于搜索")
+                                    .font(.system(size: metrics.value(11), weight: .semibold))
+                                    .foregroundStyle(ClosetTheme.textSecondary)
+                            }
+
+                            Text("场景分类自动生成，其他标签只参与搜索。点一下即可添加或取消。")
+                                .font(.system(size: metrics.value(12), weight: .medium))
+                                .foregroundStyle(ClosetTheme.textSecondary)
+
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: metrics.value(8)) {
+                                    ForEach(suggestedTags, id: \.self) { tag in
+                                        Button {
+                                            toggleTag(tag)
+                                        } label: {
+                                            detailTagChip(tag, selected: latestLook.tags.contains(tag))
+                                        }
+                                    }
+                                }
+                            }
+
+                            HStack(spacing: metrics.value(10)) {
+                                TextField("输入自定义标签", text: $customTagText)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: metrics.value(13), weight: .medium))
+                                    .padding(.horizontal, metrics.value(14))
+                                    .frame(height: metrics.value(42))
+                                    .background(Color.white.opacity(0.86))
+                                    .clipShape(Capsule())
+
+                                Button("添加") {
+                                    addCustomTag()
+                                }
+                                .font(.system(size: metrics.value(13), weight: .semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, metrics.value(14))
+                                .frame(height: metrics.value(42))
+                                .background(ClosetTheme.accentGradient)
+                                .clipShape(Capsule())
+                            }
 
                             if !latestLook.tags.isEmpty {
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     HStack(spacing: metrics.value(8)) {
                                         ForEach(latestLook.tags, id: \.self) { tag in
-                                            Text(tag)
-                                                .font(.system(size: metrics.value(11), weight: .semibold))
-                                                .foregroundStyle(ClosetTheme.textPrimary)
-                                                .padding(.horizontal, metrics.value(10))
-                                                .padding(.vertical, metrics.value(6))
-                                                .background(
-                                                    Capsule()
-                                                        .fill(Color.white.opacity(0.78))
-                                                )
+                                            detailTagChip(tag, selected: true)
                                         }
                                     }
                                 }
@@ -3916,6 +4388,58 @@ struct OutfitDetailSheet: View {
                 selectedGalleryPageID = preferredGalleryPageID(for: latestLook)
             }
         }
+    }
+
+    private func detailActionLabel(_ title: String, systemImage: String, tint: Color = ClosetTheme.textPrimary) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: metrics.value(12), weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, metrics.value(12))
+            .frame(height: metrics.value(36))
+            .background(ClosetTheme.secondaryCard)
+            .clipShape(Capsule())
+    }
+
+    private func detailMetaChip(_ title: String, tint: Color, textColor: Color) -> some View {
+        Text(title)
+            .font(.system(size: metrics.value(11.5), weight: .bold))
+            .foregroundStyle(textColor)
+            .padding(.horizontal, metrics.value(10))
+            .padding(.vertical, metrics.value(6))
+            .background(Capsule().fill(tint))
+    }
+
+    private func detailTagChip(_ tag: String, selected: Bool) -> some View {
+        Text(tag)
+            .font(.system(size: metrics.value(11.5), weight: .semibold))
+            .foregroundStyle(selected ? .white : ClosetTheme.textPrimary)
+            .padding(.horizontal, metrics.value(11))
+            .padding(.vertical, metrics.value(7))
+            .background(
+                Capsule()
+                    .fill(selected ? AnyShapeStyle(ClosetTheme.accentGradient) : AnyShapeStyle(Color.white.opacity(0.8)))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(selected ? Color.clear : ClosetTheme.line.opacity(0.8), lineWidth: 1)
+            )
+    }
+
+    private func toggleTag(_ tag: String) {
+        var nextTags = latestLook.tags
+        if let index = nextTags.firstIndex(of: tag) {
+            nextTags.remove(at: index)
+        } else {
+            nextTags.append(tag)
+        }
+        store.setOutfitTags(latestLook.id, tags: nextTags)
+    }
+
+    private func addCustomTag() {
+        let trimmed = customTagText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.setOutfitTags(latestLook.id, tags: latestLook.tags + [trimmed])
+        customTagText = ""
     }
 
     private var availableCoverOptions: [(source: OutfitCoverSource, title: String)] {
@@ -4482,15 +5006,15 @@ struct OutfitEditSheet: View {
     private func defaultLayout(for itemID: UUID, section: WardrobeSection) -> OutfitItemLayout {
         switch section {
         case .top:
-            return OutfitItemLayout(itemID: itemID, x: 0.5, y: 0.2, scale: 1.02, rotation: 0)
+            return OutfitItemLayout(itemID: itemID, x: 0.26, y: 0.22, scale: 1.08, rotation: 0)
         case .bottom:
-            return OutfitItemLayout(itemID: itemID, x: 0.5, y: 0.53, scale: 0.98, rotation: 0)
+            return OutfitItemLayout(itemID: itemID, x: 0.26, y: 0.66, scale: 1.06, rotation: 0)
         case .dress:
-            return OutfitItemLayout(itemID: itemID, x: 0.5, y: 0.42, scale: 1.05, rotation: 0)
+            return OutfitItemLayout(itemID: itemID, x: 0.26, y: 0.44, scale: 1.26, rotation: 0)
         case .shoes:
-            return OutfitItemLayout(itemID: itemID, x: 0.5, y: 0.8, scale: 0.92, rotation: 0)
+            return OutfitItemLayout(itemID: itemID, x: 0.73, y: 0.76, scale: 0.84, rotation: 0)
         case .uncategorized:
-            return OutfitItemLayout(itemID: itemID, x: 0.76, y: 0.48, scale: 0.92, rotation: 0)
+            return OutfitItemLayout(itemID: itemID, x: 0.73, y: 0.24, scale: 0.82, rotation: 0)
         }
     }
 
@@ -4842,7 +5366,8 @@ struct BodyPhotoCard: View {
                             if let image = phase.image {
                                 image
                                     .resizable()
-                                    .scaledToFill()
+                                    .scaledToFit()
+                                    .padding(metrics.value(10))
                             } else {
                                 placeholderBodyPhoto
                             }
@@ -4850,7 +5375,8 @@ struct BodyPhotoCard: View {
                     } else if let image = LocalImageStore.shared.loadImage(named: photo.localFileName) {
                         Image(uiImage: image)
                             .resizable()
-                            .scaledToFill()
+                            .scaledToFit()
+                            .padding(metrics.value(10))
                     } else {
                         placeholderBodyPhoto
                     }
@@ -4918,32 +5444,31 @@ struct FloatingTabBar: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(ClosetTab.allCases) { tab in
-                Button {
+                VStack(spacing: metrics.value(5)) {
+                    ZStack {
+                        if selectedTab == tab {
+                            RoundedRectangle(cornerRadius: metrics.value(12))
+                                .fill(ClosetTheme.accentGradient)
+                                .frame(width: metrics.value(46), height: metrics.value(34))
+                                .shadow(color: ClosetTheme.indigo.opacity(0.3), radius: 8, y: 4)
+                        }
+                        Image(systemName: selectedTab == tab ? tab.selectedIcon : tab.icon)
+                            .font(.system(size: metrics.value(20), weight: .medium))
+                            .foregroundStyle(selectedTab == tab ? .white : ClosetTheme.textSecondary.opacity(0.55))
+                    }
+                    .frame(height: metrics.value(34))
+
+                    Text(tab.title)
+                        .font(.system(size: metrics.value(12), weight: selectedTab == tab ? .bold : .medium))
+                        .foregroundStyle(selectedTab == tab ? ClosetTheme.indigo : ClosetTheme.textSecondary.opacity(0.55))
+                }
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .onTapGesture {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                         selectedTab = tab
                     }
-                } label: {
-                    VStack(spacing: metrics.value(5)) {
-                        ZStack {
-                            if selectedTab == tab {
-                                RoundedRectangle(cornerRadius: metrics.value(12))
-                                    .fill(ClosetTheme.accentGradient)
-                                    .frame(width: metrics.value(46), height: metrics.value(34))
-                                    .shadow(color: ClosetTheme.indigo.opacity(0.3), radius: 8, y: 4)
-                            }
-                            Image(systemName: selectedTab == tab ? tab.selectedIcon : tab.icon)
-                                .font(.system(size: metrics.value(20), weight: .medium))
-                                .foregroundStyle(selectedTab == tab ? .white : ClosetTheme.textSecondary.opacity(0.55))
-                        }
-                        .frame(height: metrics.value(34))
-
-                        Text(tab.title)
-                            .font(.system(size: metrics.value(12), weight: selectedTab == tab ? .bold : .medium))
-                            .foregroundStyle(selectedTab == tab ? ClosetTheme.indigo : ClosetTheme.textSecondary.opacity(0.55))
-                    }
-                    .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, metrics.value(12))
@@ -6720,7 +7245,7 @@ private extension WardrobeFilter {
         case .dress: category == .dress
         case .outerwear: category == .outerwear
         case .shoes: category == .shoes
-        case .accessory: category == .accessory
+        case .hat, .accessory, .bag: category == .accessory
         }
     }
 }
@@ -7308,6 +7833,8 @@ struct BodyPhotoPickerRow: View {
     let metrics: LayoutMetrics
 
     @State private var selectedItem: PhotosPickerItem?
+    @State private var isProcessing = false
+    @State private var processingMessage: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -7315,20 +7842,30 @@ struct BodyPhotoPickerRow: View {
                 if compact {
                     VStack(alignment: .leading, spacing: metrics.value(8)) {
                         GarmentPreviewWindow(cornerRadius: metrics.value(18), thumbnailWidth: nil) {
-                            if let previewData, let image = UIImage(data: previewData) {
-                                Image(uiImage: image)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .padding(metrics.value(10))
-                            } else if let image = LocalImageStore.shared.loadImage(named: photo.imageFileName) {
-                                Image(uiImage: image)
-                                    .resizable()
-                                    .scaledToFit()
-                                    .padding(metrics.value(10))
-                            } else {
-                                Image(systemName: photo.symbol)
-                                    .font(.system(size: metrics.value(28), weight: .medium))
-                                    .foregroundStyle(ClosetTheme.textSecondary.opacity(0.5))
+                            ZStack {
+                                if let previewData, let image = UIImage(data: previewData) {
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .padding(metrics.value(10))
+                                } else if let image = LocalImageStore.shared.loadImage(named: photo.imageFileName) {
+                                    Image(uiImage: image)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .padding(metrics.value(10))
+                                } else {
+                                    Image(systemName: photo.symbol)
+                                        .font(.system(size: metrics.value(28), weight: .medium))
+                                        .foregroundStyle(ClosetTheme.textSecondary.opacity(0.5))
+                                }
+
+                                if isProcessing {
+                                    RoundedRectangle(cornerRadius: metrics.value(14))
+                                        .fill(.ultraThinMaterial)
+                                        .padding(metrics.value(10))
+                                    ProgressView()
+                                        .tint(ClosetTheme.textPrimary)
+                                }
                             }
                         }
                         .aspectRatio(9.0 / 16.0, contentMode: .fit)
@@ -7337,31 +7874,70 @@ struct BodyPhotoPickerRow: View {
                             .font(.system(size: metrics.value(12), weight: .semibold))
                             .foregroundStyle(ClosetTheme.textPrimary)
                             .frame(maxWidth: .infinity, alignment: .center)
+
+                        if let processingMessage {
+                            Text(processingMessage)
+                                .font(.system(size: metrics.value(10), weight: .medium))
+                                .foregroundStyle(ClosetTheme.textSecondary)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
                     }
                 } else {
-                    PhotoPreviewCard(
-                        title: photo.title,
-                        imageData: previewData,
-                        storedFileName: photo.imageFileName,
-                        placeholderSystemName: photo.symbol,
-                        layoutStyle: .hero
-                    )
+                    ZStack(alignment: .bottom) {
+                        PhotoPreviewCard(
+                            title: photo.title,
+                            imageData: previewData,
+                            storedFileName: photo.imageFileName,
+                            placeholderSystemName: photo.symbol,
+                            layoutStyle: .hero
+                        )
+
+                        if isProcessing || processingMessage != nil {
+                            HStack(spacing: 8) {
+                                if isProcessing {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                                Text(processingMessage ?? "正在处理照片")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            .foregroundStyle(ClosetTheme.textPrimary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Capsule())
+                            .padding(.bottom, 12)
+                        }
+                    }
                 }
             }
+            .disabled(isProcessing)
             if previewData != nil || photo.imageFileName != nil {
                 Button("删除当前照片", role: .destructive) {
                     onRemovePhoto()
                 }
                 .font(.system(size: compact ? metrics.value(11) : 15, weight: .medium))
                 .frame(maxWidth: compact ? .infinity : nil, alignment: compact ? .center : .leading)
+                .disabled(isProcessing)
             }
         }
         .task(id: selectedItem) {
             guard let selectedItem else { return }
-            if let data = try? await selectedItem.loadTransferable(type: Data.self) {
-                onPhotoPicked(data)
+            defer { self.selectedItem = nil }
+            guard let data = try? await selectedItem.loadTransferable(type: Data.self) else { return }
+
+            await MainActor.run {
+                isProcessing = true
+                processingMessage = "正在一键抠图"
             }
-            self.selectedItem = nil
+
+            let prepared = await BackgroundRemovalService.shared.prepareWardrobeImage(from: data)
+
+            await MainActor.run {
+                onPhotoPicked(prepared.imageData)
+                isProcessing = false
+                processingMessage = prepared.didRemoveBackground ? "已自动抠图" : "未识别到主体，已保留原图"
+            }
         }
     }
 }

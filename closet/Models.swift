@@ -51,13 +51,19 @@ enum WardrobeFilter: String, CaseIterable, Identifiable {
     case all = "全部"
     case top = "上装"
     case bottom = "下装"
-    case shoes = "鞋履"
-    case dress = "连衣裙"
     case outerwear = "外套"
-    case accessory = "配饰"
+    case dress = "连衣裙"
+    case shoes = "鞋子"
+    case hat = "帽子"
+    case accessory = "饰品"
+    case bag = "包"
     case uncategorized = "未分类"
 
     var id: String { rawValue }
+
+    static var allCases: [WardrobeFilter] {
+        [.all, .top, .bottom, .outerwear, .dress, .shoes, .hat, .accessory, .bag, .uncategorized]
+    }
 }
 
 enum WardrobeSection: String, CaseIterable, Identifiable, Codable {
@@ -87,6 +93,37 @@ enum WardrobeSection: String, CaseIterable, Identifiable, Codable {
         case .dress: .dress
         case .shoes: .shoes
         }
+    }
+}
+
+enum OutfitSceneFilter: String, CaseIterable, Identifiable {
+    case all = "全部"
+    case daily = "日常"
+    case commute = "通勤"
+    case date = "约会"
+    case party = "聚会"
+    case outing = "出游"
+    case sport = "运动"
+    case formal = "正式"
+    case vacation = "度假"
+    case uncategorized = "未分类"
+
+    var id: String { rawValue }
+
+    static func from(category: String?) -> OutfitSceneFilter {
+        guard let category = category?.trimmingCharacters(in: .whitespacesAndNewlines), !category.isEmpty else {
+            return .uncategorized
+        }
+
+        if category.contains("通勤") { return .commute }
+        if category.contains("约会") { return .date }
+        if category.contains("聚会") || category.contains("派对") { return .party }
+        if category.contains("出游") || category.contains("旅行") { return .outing }
+        if category.contains("运动") || category.contains("健身") { return .sport }
+        if category.contains("正式") || category.contains("商务") || category.contains("面试") { return .formal }
+        if category.contains("度假") || category.contains("海边") { return .vacation }
+        if category.contains("日常") { return .daily }
+        return .uncategorized
     }
 }
 
@@ -196,6 +233,101 @@ struct ClosetItem: Identifiable, Codable, Equatable {
     }
 }
 
+enum WardrobeAccessoryKind {
+    case hat
+    case bag
+    case accessory
+}
+
+extension ClosetItem {
+    var accessoryKind: WardrobeAccessoryKind? {
+        guard section == .uncategorized else { return nil }
+        let source = wardrobeCategoryInferenceText
+        if source.contains("帽") || source.contains("cap") || source.contains("hat") || source.contains("beanie") {
+            return .hat
+        }
+        if source.contains("包") || source.contains("bag") || source.contains("tote") || source.contains("backpack") || source.contains("handbag") || source.contains("斜挎") || source.contains("双肩") {
+            return .bag
+        }
+        return .accessory
+    }
+
+    var wardrobeFilter: WardrobeFilter {
+        switch section {
+        case .top:
+            return isLikelyOuterwear ? .outerwear : .top
+        case .bottom:
+            return .bottom
+        case .dress:
+            return .dress
+        case .shoes:
+            return .shoes
+        case .uncategorized:
+            switch accessoryKind {
+            case .hat:
+                return .hat
+            case .bag:
+                return .bag
+            case .accessory, .none:
+                return .accessory
+            }
+        }
+    }
+
+    func matches(filter: WardrobeFilter) -> Bool {
+        filter == .all || wardrobeFilter == filter
+    }
+
+    var wardrobeSearchText: String {
+        [
+            name,
+            color,
+            brand,
+            section.rawValue,
+            wardrobeFilter.rawValue,
+            aiAnalysis.style.joined(separator: " "),
+            aiAnalysis.seasons.joined(separator: " "),
+            aiAnalysis.materials.joined(separator: " "),
+            aiAnalysis.silhouette ?? "",
+            aiAnalysis.pattern ?? "",
+            aiAnalysis.occasions.joined(separator: " "),
+            aiAnalysis.formality ?? "",
+            aiAnalysis.warmth ?? ""
+        ]
+        .joined(separator: " ")
+        .lowercased()
+    }
+
+    private var isLikelyOuterwear: Bool {
+        let source = wardrobeCategoryInferenceText
+        return source.contains("外套")
+            || source.contains("大衣")
+            || source.contains("夹克")
+            || source.contains("风衣")
+            || source.contains("开衫")
+            || source.contains("西装外套")
+            || source.contains("coat")
+            || source.contains("jacket")
+            || source.contains("blazer")
+            || source.contains("cardigan")
+            || source.contains("outerwear")
+    }
+
+    private var wardrobeCategoryInferenceText: String {
+        [
+            name,
+            color,
+            brand,
+            aiAnalysis.silhouette ?? "",
+            aiAnalysis.pattern ?? "",
+            aiAnalysis.style.joined(separator: " "),
+            aiAnalysis.materials.joined(separator: " ")
+        ]
+        .joined(separator: " ")
+        .lowercased()
+    }
+}
+
 struct OutfitPreview: Identifiable, Codable, Equatable {
     let id: UUID
     var title: String
@@ -213,6 +345,7 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
     var tryOnImageFileName: String?
     var realPhotoFileName: String?
     var coverImageSource: OutfitCoverSource
+    var isGeneratingTryOn: Bool
 
     init(
         id: UUID = UUID(),
@@ -230,7 +363,8 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         photoFileName: String? = nil,
         tryOnImageFileName: String? = nil,
         realPhotoFileName: String? = nil,
-        coverImageSource: OutfitCoverSource = .canvas
+        coverImageSource: OutfitCoverSource = .canvas,
+        isGeneratingTryOn: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -247,6 +381,7 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         self.tryOnImageFileName = tryOnImageFileName ?? photoFileName
         self.realPhotoFileName = realPhotoFileName
         self.coverImageSource = coverImageSource
+        self.isGeneratingTryOn = isGeneratingTryOn
         self.photoFileName = photoFileName ?? {
             switch coverImageSource {
             case .canvas:
@@ -276,6 +411,7 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         case tryOnImageFileName
         case realPhotoFileName
         case coverImageSource
+        case isGeneratingTryOn
     }
 
     init(from decoder: Decoder) throws {
@@ -304,6 +440,7 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         } else {
             coverImageSource = .canvas
         }
+        isGeneratingTryOn = try container.decodeIfPresent(Bool.self, forKey: .isGeneratingTryOn) ?? false
     }
 }
 

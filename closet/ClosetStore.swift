@@ -444,7 +444,8 @@ final class ClosetStore: ObservableObject {
             sourceMode: .ai,
             photoFileName: generatedTryOnFileName,
             tryOnImageFileName: generatedTryOnFileName,
-            coverImageSource: .tryOn
+            coverImageSource: .tryOn,
+            isGeneratingTryOn: false
         )
         savedLooks.insert(outfit, at: 0)
         return outfit
@@ -468,7 +469,8 @@ final class ClosetStore: ObservableObject {
             tags: outfitMetadata.tags,
             aiSummary: outfitMetadata.summary,
             sourceMode: .manual,
-            coverImageSource: .canvas
+            coverImageSource: .canvas,
+            isGeneratingTryOn: false
         )
         savedLooks.insert(outfit, at: 0)
         return outfit
@@ -512,7 +514,37 @@ final class ClosetStore: ObservableObject {
             sourceMode: .manual,
             photoFileName: generatedPhotoFileName,
             tryOnImageFileName: generatedPhotoFileName,
-            coverImageSource: generatedPhotoFileName == nil ? .canvas : .tryOn
+            coverImageSource: generatedPhotoFileName == nil ? .canvas : .tryOn,
+            isGeneratingTryOn: false
+        )
+        savedLooks.insert(outfit, at: 0)
+        return outfit
+    }
+
+    func saveManualOutfitAndQueueTryOn(
+        itemIDs: [UUID],
+        itemLayouts: [OutfitItemLayout]? = nil,
+        prompt: String? = nil
+    ) -> OutfitPreview? {
+        let items = activeWardrobeItems.filter { itemIDs.contains($0.id) }
+        guard !items.isEmpty else { return nil }
+        let outfitMetadata = analyzeOutfit(items: items, customPrompt: prompt)
+        let title = "手动选择 \(savedLooks.count + 1)"
+        let subtitle = items.map(\.name).joined(separator: " + ")
+        let layouts = normalizedLayouts(for: itemIDs, proposed: itemLayouts)
+        let outfit = OutfitPreview(
+            title: title,
+            subtitle: subtitle,
+            symbol: "hand.raised",
+            accent: items.first?.gradientName ?? "cloud",
+            itemIDs: itemIDs,
+            itemLayouts: layouts,
+            outfitCategory: outfitMetadata.category,
+            tags: outfitMetadata.tags,
+            aiSummary: outfitMetadata.summary,
+            sourceMode: .manual,
+            coverImageSource: .canvas,
+            isGeneratingTryOn: true
         )
         savedLooks.insert(outfit, at: 0)
         return outfit
@@ -540,6 +572,36 @@ final class ClosetStore: ObservableObject {
         )
         savedLooks[index].coverImageSource = availableCoverSources(for: savedLooks[index]).contains(draft.coverImageSource) ? draft.coverImageSource : defaultCoverSource(for: savedLooks[index])
         savedLooks[index].photoFileName = resolvedCoverFileName(for: savedLooks[index])
+    }
+
+    func generateQueuedTryOnCover(for outfitID: UUID, prompt: String? = nil) async {
+        guard let index = savedLooks.firstIndex(where: { $0.id == outfitID }) else { return }
+        let outfit = savedLooks[index]
+        let items = activeWardrobeItems.filter { outfit.itemIDs.contains($0.id) }
+        guard !items.isEmpty else {
+            savedLooks[index].isGeneratingTryOn = false
+            return
+        }
+
+        do {
+            let imageData = try await doubaoOutfitImageService.generateOutfitImage(
+                prompt: manualOutfitCoverPrompt(customPrompt: prompt, items: items),
+                profile: profile,
+                weather: weather,
+                items: items
+            )
+            let fileName = LocalImageStore.shared.saveImageData(imageData, prefix: "outfit-manual")
+            guard let refreshedIndex = savedLooks.firstIndex(where: { $0.id == outfitID }) else { return }
+            savedLooks[refreshedIndex].tryOnImageFileName = fileName
+            if savedLooks[refreshedIndex].coverImageSource == .tryOn || savedLooks[refreshedIndex].photoFileName == nil {
+                savedLooks[refreshedIndex].coverImageSource = .tryOn
+                savedLooks[refreshedIndex].photoFileName = fileName
+            }
+            savedLooks[refreshedIndex].isGeneratingTryOn = false
+        } catch {
+            guard let refreshedIndex = savedLooks.firstIndex(where: { $0.id == outfitID }) else { return }
+            savedLooks[refreshedIndex].isGeneratingTryOn = false
+        }
     }
 
     func updateOutfitWithGeneratedCover(
@@ -594,6 +656,11 @@ final class ClosetStore: ObservableObject {
         let nextSource = availableSources.contains(source) ? source : defaultCoverSource(for: savedLooks[index])
         savedLooks[index].coverImageSource = nextSource
         savedLooks[index].photoFileName = resolvedCoverFileName(for: savedLooks[index])
+    }
+
+    func setOutfitTags(_ outfitID: UUID, tags: [String]) {
+        guard let index = savedLooks.firstIndex(where: { $0.id == outfitID }) else { return }
+        savedLooks[index].tags = deduplicated(tags)
     }
 
     func deleteOutfit(_ outfitID: UUID) {
@@ -1008,20 +1075,103 @@ final class ClosetStore: ObservableObject {
     }
 
     private func defaultLayouts(for itemIDs: [UUID]) -> [OutfitItemLayout] {
-        let presets: [(Double, Double)] = [
-            (0.5, 0.2),
-            (0.5, 0.5),
-            (0.5, 0.8),
-            (0.28, 0.48),
-            (0.72, 0.48),
-            (0.28, 0.8),
-            (0.72, 0.8)
-        ]
-        return itemIDs.enumerated().map { index, itemID in
-            let preset = presets[min(index, presets.count - 1)]
-            let scale = index == 0 ? 1.08 : 0.96
-            return OutfitItemLayout(itemID: itemID, x: preset.0, y: preset.1, scale: scale, rotation: 0)
+        let itemMap = Dictionary(uniqueKeysWithValues: wardrobeItems.map { ($0.id, $0) })
+        let topItems: [ClosetItem] = itemIDs.compactMap { itemID in
+            guard let item = itemMap[itemID], item.section == .top else { return nil }
+            return item
         }
+        let bottomItems: [ClosetItem] = itemIDs.compactMap { itemID in
+            guard let item = itemMap[itemID], item.section == .bottom else { return nil }
+            return item
+        }
+        let dressItems: [ClosetItem] = itemIDs.compactMap { itemID in
+            guard let item = itemMap[itemID], item.section == .dress else { return nil }
+            return item
+        }
+        let shoeItems: [ClosetItem] = itemIDs.compactMap { itemID in
+            guard let item = itemMap[itemID], item.section == .shoes else { return nil }
+            return item
+        }
+        let accessoryItems: [ClosetItem] = itemIDs.compactMap { itemID in
+            guard let item = itemMap[itemID], item.section == .uncategorized else { return nil }
+            return item
+        }
+
+        var layouts: [OutfitItemLayout] = []
+
+        if let dress = dressItems.first {
+            layouts.append(OutfitItemLayout(itemID: dress.id, x: 0.26, y: 0.44, scale: 1.26, rotation: 0))
+        } else {
+            if let top = topItems.first {
+                layouts.append(OutfitItemLayout(itemID: top.id, x: 0.26, y: 0.22, scale: 1.08, rotation: 0))
+            }
+            if let bottom = bottomItems.first {
+                layouts.append(OutfitItemLayout(itemID: bottom.id, x: 0.26, y: 0.66, scale: 1.06, rotation: 0))
+            }
+        }
+
+        let accessoryGroups = Dictionary(grouping: accessoryItems, by: accessoryLayoutKind(for:))
+        if let hat = accessoryGroups[.hat]?.first {
+            layouts.append(OutfitItemLayout(itemID: hat.id, x: 0.77, y: 0.16, scale: 0.7, rotation: 0))
+        }
+        if let bag = accessoryGroups[.bag]?.first {
+            layouts.append(OutfitItemLayout(itemID: bag.id, x: 0.71, y: 0.30, scale: 0.84, rotation: 0))
+        }
+        if let accessory = accessoryGroups[.accessory]?.first {
+            layouts.append(OutfitItemLayout(itemID: accessory.id, x: 0.82, y: 0.42, scale: 0.62, rotation: 0))
+        }
+
+        if let shoes = shoeItems.first {
+            layouts.append(OutfitItemLayout(itemID: shoes.id, x: 0.73, y: 0.76, scale: 0.84, rotation: 0))
+        }
+
+        let usedIDs = Set(layouts.map(\.itemID))
+        let remainingItems = itemIDs.compactMap { itemMap[$0] }.filter { !usedIDs.contains($0.id) }
+        let extraPresets: [(Double, Double, Double)] = [
+            (0.73, 0.40, 0.74),
+            (0.73, 0.56, 0.74),
+            (0.73, 0.88, 0.72),
+            (0.26, 0.86, 0.78)
+        ]
+
+        for (index, item) in remainingItems.enumerated() {
+            let preset = extraPresets[min(index, extraPresets.count - 1)]
+            layouts.append(
+                OutfitItemLayout(
+                    itemID: item.id,
+                    x: preset.0,
+                    y: preset.1,
+                    scale: preset.2,
+                    rotation: 0
+                )
+            )
+        }
+
+        return itemIDs.compactMap { itemID in
+            layouts.first(where: { $0.itemID == itemID })
+        }
+    }
+
+    private func accessoryLayoutKind(for item: ClosetItem) -> AccessoryLayoutKind {
+        let source = [item.name, item.color, item.brand, item.aiAnalysis.pattern ?? "", item.aiAnalysis.silhouette ?? ""]
+            .joined(separator: " ")
+            .lowercased()
+
+        if source.contains("帽") || source.contains("cap") || source.contains("hat") || source.contains("beanie") {
+            return .hat
+        }
+
+        if source.contains("包") || source.contains("bag") || source.contains("tote") || source.contains("backpack") || source.contains("handbag") || source.contains("斜挎") || source.contains("双肩") {
+            return .bag
+        }
+
+        return .accessory
+    }
+
+    private enum AccessoryLayoutKind {
+        case hat
+        case bag
+        case accessory
     }
 
     private func availableCoverSources(for outfit: OutfitPreview) -> [OutfitCoverSource] {
@@ -1352,32 +1502,44 @@ final class ClosetStore: ObservableObject {
         warmth: String?
     ) -> String {
         if let occasion {
-            if occasion.contains("通勤") { return "通勤搭配" }
-            if occasion.contains("约会") || occasion.contains("聚会") { return "约会搭配" }
-            if occasion.contains("旅行") { return "出游搭配" }
-            if occasion.contains("运动") { return "运动搭配" }
+            if occasion.contains("通勤") { return "通勤" }
+            if occasion.contains("约会") { return "约会" }
+            if occasion.contains("聚会") || occasion.contains("派对") { return "聚会" }
+            if occasion.contains("旅行") || occasion.contains("出游") { return "出游" }
+            if occasion.contains("运动") || occasion.contains("健身") { return "运动" }
+            if occasion.contains("日常") { return "日常" }
         }
 
         if promptKeywords.contains(where: { ["通勤", "上班", "办公室"].contains($0) }) {
-            return "通勤搭配"
+            return "通勤"
         }
-        if promptKeywords.contains(where: { ["约会", "聚会"].contains($0) }) {
-            return "约会搭配"
+        if promptKeywords.contains(where: { ["约会"].contains($0) }) {
+            return "约会"
+        }
+        if promptKeywords.contains(where: { ["聚会", "派对"].contains($0) }) {
+            return "聚会"
         }
         if promptKeywords.contains(where: { ["旅行", "出游"].contains($0) }) {
-            return "出游搭配"
+            return "出游"
+        }
+        if promptKeywords.contains(where: { ["度假", "海边"].contains($0) }) {
+            return "度假"
+        }
+        if promptKeywords.contains(where: { ["运动", "健身"].contains($0) }) {
+            return "运动"
+        }
+        if promptKeywords.contains(where: { ["正式", "商务", "面试"].contains($0) }) {
+            return "正式"
         }
         if warmth?.contains("保暖") == true || weather.feelsLike <= 8 {
-            return "保暖搭配"
-        }
-        if let style {
-            if style.contains("简约") || style.contains("极简") { return "简约搭配" }
-            if style.contains("复古") { return "复古搭配" }
-            if style.contains("街头") { return "街头搭配" }
-            if style.contains("温柔") { return "温柔搭配" }
+            return "日常"
         }
 
-        return "日常搭配"
+        if let style, style.contains("正式") || style.contains("干练") {
+            return "正式"
+        }
+
+        return "日常"
     }
 
     private func dominantWarmth(in items: [ClosetItem]) -> String? {
@@ -1398,7 +1560,7 @@ final class ClosetStore: ObservableObject {
         promptKeywords: [String],
         items: [ClosetItem]
     ) -> [String] {
-        var tags: [String] = [category]
+        var tags: [String] = []
 
         if let occasionTag = normalizedOccasionTag(from: occasion, promptKeywords: promptKeywords) {
             tags.append(occasionTag)

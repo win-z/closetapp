@@ -25,9 +25,7 @@ struct MainTabView: View {
                 currentScreen(metrics: metrics)
                     .frame(maxWidth: 430)
                     .frame(maxWidth: .infinity)
-                    .safeAreaInset(edge: .bottom) {
-                        Color.clear.frame(height: metrics.tabInsetHeight)
-                    }
+                    .padding(.bottom, metrics.tabInsetHeight)
 
                 FloatingTabBar(selectedTab: Binding(
                     get: { appViewModel.selectedTab },
@@ -79,4 +77,5 @@ struct MainTabView: View {
             )
         }
     }
+
 }
