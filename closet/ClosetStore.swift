@@ -678,13 +678,26 @@ final class ClosetStore: ObservableObject {
     }
 
     func markers(for month: Date) -> [DiaryMarker] {
-        diaryEntries.compactMap { entry in
-            guard calendar.isDate(entry.date, equalTo: month, toGranularity: .month) else { return nil }
+        let entriesForMonth = diaryEntries.filter { entry in
+            calendar.isDate(entry.date, equalTo: month, toGranularity: .month)
+        }
+
+        let uniqueEntries = entriesForMonth.reduce(into: [Int: DiaryEntry]()) { result, entry in
+            let day = calendar.component(.day, from: entry.date)
+            if result[day] == nil {
+                result[day] = entry
+            }
+        }
+
+        return uniqueEntries.values.compactMap { entry in
+            let hasDisplayablePhoto = hasDisplayableDiaryPhoto(for: entry)
+            let hasDisplayableOutfit = hasDisplayableDiaryOutfit(for: entry)
+            guard hasDisplayablePhoto || hasDisplayableOutfit else { return nil }
             return DiaryMarker(
                 day: calendar.component(.day, from: entry.date),
                 hasRecord: true,
-                hasPhoto: entry.hasPhoto,
-                hasOutfit: entry.outfitID != nil,
+                hasPhoto: hasDisplayablePhoto,
+                hasOutfit: hasDisplayableOutfit,
                 mood: entry.mood
             )
         }
@@ -861,6 +874,32 @@ final class ClosetStore: ObservableObject {
                 wardrobeItems[index].wearCount += 1
             }
         }
+    }
+
+    private func hasDisplayableDiaryPhoto(for entry: DiaryEntry) -> Bool {
+        if let outfitID = entry.outfitID,
+           let outfit = savedLooks.first(where: { $0.id == outfitID }),
+           LocalImageStore.shared.loadImage(named: outfit.photoFileName) != nil {
+            return true
+        }
+
+        guard let fileName = entry.photoFileName else { return false }
+        return LocalImageStore.shared.loadImage(named: fileName) != nil
+    }
+
+    private func hasDisplayableDiaryOutfit(for entry: DiaryEntry) -> Bool {
+        let existingWardrobeIDs = Set(wardrobeItems.map(\.id))
+
+        if !entry.itemIDs.isEmpty {
+            return entry.itemIDs.contains { existingWardrobeIDs.contains($0) }
+        }
+
+        guard let outfitID = entry.outfitID,
+              let outfit = savedLooks.first(where: { $0.id == outfitID }) else {
+            return false
+        }
+
+        return outfit.itemIDs.contains { existingWardrobeIDs.contains($0) }
     }
 
     private func persist() {

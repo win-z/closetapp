@@ -1,4 +1,7 @@
 Config/Secrets.xcconfig
 Config/Server.env
+Config/GitHub.local.env
 .DerivedData/
+.DerivedDataDiag/
+.DerivedDataLocal/
 .DS_Store
