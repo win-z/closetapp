@@ -28,6 +28,7 @@ struct ClothingItem: Codable, Identifiable, Equatable {
     var price: Double?
     var purchaseDate: String?
     var tags: [String]
+    var aiAnalysis: ClothingAIAnalysis?
     var lastWorn: String?
     var isArchived: Bool
     var wearCount: Int
@@ -58,6 +59,7 @@ struct AutoTagResponse: Decodable, Equatable {
     var color: String?
     var brand: String?
     var tags: [String]?
+    var aiAnalysis: ClothingAIAnalysis?
 }
 
 struct BodyProfile: Codable, Equatable {

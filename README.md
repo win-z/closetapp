@@ -20,6 +20,29 @@
 2. 按需补充 `Config/Secrets.xcconfig` 和 `Config/Server.env`
 3. 选择模拟器或真机运行
 
+### 豆包试穿图配置
+
+应用内的 AI 搭配图/试穿图使用豆包图片生成接口，当前接入配置如下：
+
+- Base URL: `https://ark.cn-beijing.volces.com/api/v3`
+- Endpoint: `/images/generations`
+- 鉴权: `Authorization: Bearer <DOUBAO_API_KEY>`
+- 默认模型: `doubao-seedream-4-5-251128`
+
+本地开发时请复制 `Config/Secrets.example.xcconfig` 为 `Config/Secrets.xcconfig`，并填写：
+
+```xcconfig
+DOUBAO_API_URL = https://ark.cn-beijing.volces.com/api/v3
+DOUBAO_API_KEY = your-doubao-api-key
+DOUBAO_MODEL = doubao-seedream-4-5-251128
+```
+
+当前项目里的试穿图生成入口：
+
+- AI 搭配生成会调用 [closet/Services/DoubaoOutfitImageService.swift](/Users/zhaojianhua/github/closet/closet/Services/DoubaoOutfitImageService.swift)
+- 手动选款保存搭配时，也会优先生成一张试穿封面图再保存
+- 参考图来源于用户三视图和已选衣物图片，生成结果保存为本地封面图
+
 ## 推送记录规范
 
 从这次开始，每次推送都要在 README 的“更新记录”里补一条，至少写清楚：
@@ -38,6 +61,29 @@
 ```
 
 ## 更新记录
+
+## v0.1.4
+
+- 新功能：
+  - AI 搭配会先根据用户需求、天气和衣物 AI 分析筛选单品，再生成搭配，并在命中已保存同款搭配时直接复用现有结果
+  - 手动搭配与 AI 搭配统一新增搭配分类、场景标签和 AI 解读，便于在“我的搭配”中搜索和浏览
+  - 搭配详情页支持三种图源切换：幕布底稿、AI 试穿图、真实照片，并可手动设置任意一种为封面
+  - 搭配详情页新增“记录”入口，可弹出当月日历选择任意日期，将当前搭配保存为当天穿搭记录
+  - 批量导入衣物改为直接回到衣橱页后台识别，识别完成后自动回填分类、名称、颜色和 AI 分析
+- 修复：
+  - 修复运行时 `DOUBAO_API_URL` 配置异常时生成请求地址错误的问题，并补强豆包与硅基流动的配置校验
+  - 修复“我的搭配”标签沿用单品标签导致语义不准确的问题，改为输出搭配层面的场景和风格标签
+  - 修复记录页当日实拍/当日搭配展示逻辑，支持关联搭配后默认显示封面图，并统一相关图片为 9:16 比例
+  - 修复搭配详情、封面切换、真实照片导入和试穿图保存相关的数据结构兼容问题
+
+## v0.1.3
+
+- 新功能：
+  - 接入豆包图片生成配置，统一使用 `https://ark.cn-beijing.volces.com/api/v3/images/generations` 生成 AI 搭配图和试穿图
+  - 手动保存搭配时新增试穿封面生成链路，使用人物三视图和所选衣物图生成保存封面
+  - README 新增豆包接入说明与本地配置示例，方便直接落地配置 `DOUBAO_API_URL`、`DOUBAO_API_KEY` 和 `DOUBAO_MODEL`
+- 修复：
+  - 补齐 `Secrets.example.xcconfig` 中缺失的豆包 URL 与模型示例，避免本地接入时只填 API Key 仍无法完整对齐环境
 
 ## v0.1.2
 

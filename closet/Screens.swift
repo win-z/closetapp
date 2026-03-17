@@ -69,6 +69,8 @@ struct WardrobeScreen: View {
     @State private var selectedItemIDs: Set<UUID> = []
     @State private var isOutfitMode = false
     @State private var selectedOutfitItemIDs: Set<UUID> = []
+    @State private var isSavingOutfit = false
+    @State private var outfitSaveErrorMessage: String?
     @State private var selectedColor = "全部颜色"
     @State private var selectedBrand = "全部品牌"
     @State private var wearFilter: LocalWearFilter = .all
@@ -76,6 +78,9 @@ struct WardrobeScreen: View {
     @State private var isRenamingCloset = false
     @State private var pendingDeleteCloset = false
     @State private var closetDraftName = ""
+    @State private var isImportingBatch = false
+
+    private let siliconFlowAutoTagService = SiliconFlowAutoTagService()
 
     var filteredItems: [ClosetItem] {
         let source = showingArchivedOnly ? store.archivedWardrobeItems : store.activeWardrobeItems
@@ -414,7 +419,7 @@ struct WardrobeScreen: View {
                     metrics: metrics
                 )
                     .padding(.trailing, metrics.horizontalPadding)
-                    .padding(.bottom, metrics.tabInsetHeight + metrics.value(8))
+                    .padding(.bottom, metrics.floatingActionBottomPadding)
                     .onTapGesture {
                         isPresentingImportPicker = true
                     }
@@ -441,13 +446,26 @@ struct WardrobeScreen: View {
         )
         .onChange(of: selectedImportItems) { _, newItems in
             guard !newItems.isEmpty else { return }
-            isAddingItem = true
+            if newItems.count > 1 {
+                isImportingBatch = true
+                let itemsToImport = newItems
+                selectedImportItems = []
+                Task {
+                    await importBatchItems(from: itemsToImport)
+                    await MainActor.run {
+                        isImportingBatch = false
+                    }
+                }
+            } else {
+                isAddingItem = true
+            }
         }
         .safeAreaInset(edge: .bottom) {
             if isOutfitMode {
                 OutfitSelectionActionBar(
                     count: selectedOutfitItemIDs.count,
                     metrics: metrics,
+                    isSaving: isSavingOutfit,
                     onCancel: {
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
                             isOutfitMode = false
@@ -459,15 +477,40 @@ struct WardrobeScreen: View {
                             .filter { selectedOutfitItemIDs.contains($0.id) }
                             .map(\.id)
                         guard !orderedIDs.isEmpty else { return }
-                        guard store.saveManualOutfit(itemIDs: orderedIDs) != nil else { return }
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
-                            isOutfitMode = false
-                            selectedOutfitItemIDs.removeAll()
+                        guard !isSavingOutfit else { return }
+                        isSavingOutfit = true
+                        outfitSaveErrorMessage = nil
+                        Task {
+                            do {
+                                let savedOutfit = try await store.saveManualOutfitWithGeneratedCover(itemIDs: orderedIDs)
+                                await MainActor.run {
+                                    if savedOutfit != nil {
+                                        withAnimation(.spring(response: 0.25, dampingFraction: 0.82)) {
+                                            isOutfitMode = false
+                                            selectedOutfitItemIDs.removeAll()
+                                        }
+                                        appViewModel.selectedTab = .stylist
+                                    }
+                                    isSavingOutfit = false
+                                }
+                            } catch {
+                                await MainActor.run {
+                                    outfitSaveErrorMessage = error.localizedDescription
+                                    isSavingOutfit = false
+                                }
+                            }
                         }
-                        appViewModel.selectedTab = .stylist
                     }
                 )
             }
+        }
+        .alert("保存搭配失败", isPresented: Binding(
+            get: { outfitSaveErrorMessage != nil },
+            set: { if !$0 { outfitSaveErrorMessage = nil } }
+        )) {
+            Button("知道了", role: .cancel) {}
+        } message: {
+            Text(outfitSaveErrorMessage ?? "请稍后重试。")
         }
         .alert("删除这件单品？", isPresented: Binding(
             get: { pendingDeleteItem != nil },
@@ -503,6 +546,81 @@ struct WardrobeScreen: View {
         } message: {
             Text(store.closetSpaces.count <= 1 ? "至少保留一个衣橱，当前不能删除。" : "删除后，这个衣橱里的衣服、搭配和记录都会被移除，身体资料不会受影响。")
         }
+        .overlay(alignment: .top) {
+            if isImportingBatch {
+                Text("正在后台导入并识别衣服...")
+                    .font(.system(size: metrics.value(13), weight: .semibold))
+                    .foregroundStyle(ClosetTheme.textPrimary)
+                    .padding(.horizontal, metrics.value(14))
+                    .padding(.vertical, metrics.value(10))
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                    .padding(.top, metrics.pageTopSpacing)
+            }
+        }
+    }
+
+    @MainActor
+    private func importBatchItems(from items: [PhotosPickerItem]) async {
+        for item in items {
+            guard let rawData = try? await item.loadTransferable(type: Data.self) else { continue }
+            let prepared = await BackgroundRemovalService.shared.prepareWardrobeImage(from: rawData)
+            guard let placeholder = store.addBatchImportedPlaceholderItem(photoData: prepared.imageData) else { continue }
+
+            let itemID = placeholder.id
+            let imageData = prepared.imageData
+            Task {
+                let metadata = await recognizeBatchMetadata(for: imageData)
+                await MainActor.run {
+                    store.applyBackgroundAutoTag(
+                        to: itemID,
+                        section: metadata.section,
+                        name: metadata.name,
+                        color: metadata.color,
+                        brand: metadata.brand,
+                        aiAnalysis: metadata.aiAnalysis
+                    )
+                }
+            }
+        }
+    }
+
+    private func recognizeBatchMetadata(for data: Data) async -> BatchPhotoDetectionResult {
+        let imageBase64 = data.base64EncodedString()
+
+        do {
+            let response = try await siliconFlowAutoTagService.autoTag(imageBase64: imageBase64)
+            return BatchPhotoDetectionResult(
+                section: section(from: response.category) ?? .uncategorized,
+                name: nonEmpty(response.name) ?? "",
+                color: nonEmpty(response.color) ?? "",
+                brand: nonEmpty(response.brand) ?? "",
+                aiAnalysis: response.aiAnalysis ?? .empty,
+                categoryRecognitionLabel: "",
+                categoryWasAutoDetected: response.category != nil
+            )
+        } catch {
+            return BatchPhotoDetectionResult(
+                section: .uncategorized,
+                name: "",
+                color: "",
+                brand: "",
+                aiAnalysis: .empty,
+                categoryRecognitionLabel: "",
+                categoryWasAutoDetected: false
+            )
+        }
+    }
+
+    private func section(from category: ClothingCategory?) -> WardrobeSection? {
+        guard let category else { return nil }
+        return WardrobeSection(category: category)
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -861,6 +979,7 @@ private struct WardrobeModeCluster: View {
 private struct OutfitSelectionActionBar: View {
     let count: Int
     let metrics: LayoutMetrics
+    let isSaving: Bool
     let onCancel: () -> Void
     let onSave: () -> Void
 
@@ -877,7 +996,7 @@ private struct OutfitSelectionActionBar: View {
                 Text(count == 0 ? "选择衣服创建搭配" : "已选 \(count) 件")
                     .font(.system(size: metrics.value(14), weight: .bold))
                     .foregroundStyle(ClosetTheme.textPrimary)
-                Text("保存后会进入我的搭配")
+                Text(isSaving ? "正在调用豆包生成试穿封面..." : "保存后会进入我的搭配")
                     .font(.system(size: metrics.value(11), weight: .medium))
                     .foregroundStyle(ClosetTheme.textSecondary)
             }
@@ -886,8 +1005,14 @@ private struct OutfitSelectionActionBar: View {
 
             Button(action: onSave) {
                 HStack(spacing: metrics.value(6)) {
-                    Image(systemName: "bookmark.fill")
-                    Text("保存搭配")
+                    if isSaving {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.85)
+                    } else {
+                        Image(systemName: "bookmark.fill")
+                    }
+                    Text(isSaving ? "生成中..." : "保存搭配")
                 }
                 .font(.system(size: metrics.value(15), weight: .bold))
                 .foregroundStyle(.white)
@@ -896,8 +1021,8 @@ private struct OutfitSelectionActionBar: View {
                 .background(ClosetTheme.accentGradient)
                 .clipShape(RoundedRectangle(cornerRadius: metrics.value(18), style: .continuous))
             }
-            .disabled(count == 0)
-            .opacity(count == 0 ? 0.55 : 1)
+            .disabled(count == 0 || isSaving)
+            .opacity(count == 0 || isSaving ? 0.55 : 1)
         }
         .padding(.horizontal, metrics.horizontalPadding)
         .padding(.top, metrics.value(12))
@@ -1040,7 +1165,7 @@ struct StylistScreen: View {
                     }
                 )
                 .padding(.trailing, metrics.horizontalPadding)
-                .padding(.bottom, metrics.tabInsetHeight + metrics.value(54))
+                .padding(.bottom, metrics.floatingPopoverBottomPadding)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .zIndex(2)
             }
@@ -1051,7 +1176,7 @@ struct StylistScreen: View {
                 metrics: metrics
             )
                 .padding(.trailing, metrics.horizontalPadding)
-                .padding(.bottom, metrics.tabInsetHeight + metrics.value(8))
+                .padding(.bottom, metrics.floatingActionBottomPadding)
                 .onTapGesture {
                     withAnimation(.spring(response: 0.22, dampingFraction: 0.84)) {
                         showingGenerateSheet.toggle()
@@ -1112,7 +1237,7 @@ private struct SavedOutfitsGrid: View {
             let linkedItems = look.itemIDs.compactMap { activeItemMap[$0] }
             let primaryFilter = primaryFilter(for: linkedItems)
             let matchesFilter = selectedFilter == .all || linkedItems.contains { $0.section.filter == selectedFilter }
-            let haystack = ([look.title, look.subtitle] + linkedItems.map(\.name)).joined(separator: " ").lowercased()
+            let haystack = ([look.title, look.subtitle, look.outfitCategory ?? "", look.aiSummary ?? ""] + look.tags + linkedItems.map(\.name)).joined(separator: " ").lowercased()
             let matchesQuery = query.isEmpty || haystack.contains(query)
             guard matchesFilter && matchesQuery else { return nil }
             return LookContext(look: look, linkedItems: linkedItems, primaryFilter: primaryFilter)
@@ -3355,6 +3480,12 @@ struct OutfitLookCard: View {
                         .font(.system(size: metrics.value(12), weight: .bold))
                         .foregroundStyle(ClosetTheme.textPrimary)
                         .lineLimit(2)
+                    if let outfitCategory = look.outfitCategory, !outfitCategory.isEmpty {
+                        Text(outfitCategory)
+                            .font(.system(size: metrics.value(10), weight: .semibold))
+                            .foregroundStyle(ClosetTheme.textSecondary)
+                            .lineLimit(1)
+                    }
                 }
                 .padding(.horizontal, metrics.value(8))
                 .padding(.top, metrics.value(8))
@@ -3415,7 +3546,11 @@ private struct OutfitPreviewThumbnail: View {
                     )
             }
 
-            if !linkedItems.isEmpty {
+            if let previewImage = LocalImageStore.shared.loadImage(named: look.photoFileName) {
+                Image(uiImage: previewImage)
+                    .resizable()
+                    .scaledToFill()
+            } else if !linkedItems.isEmpty {
                 OutfitCanvasBoard(
                     items: linkedItems,
                     layouts: .constant(normalizedLayouts),
@@ -3515,6 +3650,11 @@ struct OutfitDetailSheet: View {
     let metrics: LayoutMetrics
 
     @State private var isEditing = false
+    @State private var selectedGalleryPageID: String = OutfitGalleryPage.canvas.id
+    @State private var selectedRealPhotoItem: PhotosPickerItem?
+    @State private var isShowingRecordCalendar = false
+    @State private var recordMonth = Calendar.current.startOfDay(for: .now)
+    @State private var selectedRecordDate = Calendar.current.startOfDay(for: .now)
 
     private var latestLook: OutfitPreview {
         store.savedLooks.first(where: { $0.id == look.id }) ?? look
@@ -3530,6 +3670,17 @@ struct OutfitDetailSheet: View {
 
     private var detailImageWidth: CGFloat {
         min(metrics.contentWidth - metrics.value(32), metrics.value(250))
+    }
+
+    private var galleryPages: [OutfitGalleryPage] {
+        var pages: [OutfitGalleryPage] = [.canvas]
+        if latestLook.tryOnImageFileName != nil {
+            pages.append(.tryOn)
+        }
+        if latestLook.realPhotoFileName != nil {
+            pages.append(.realPhoto)
+        }
+        return pages
     }
 
     private var resolvedLayouts: [OutfitItemLayout] {
@@ -3562,17 +3713,100 @@ struct OutfitDetailSheet: View {
                             .font(.system(size: metrics.value(24), weight: .heavy))
                             .foregroundStyle(ClosetTheme.textPrimary)
                             .padding(.horizontal, metrics.horizontalPadding)
+
+                        if let outfitCategory = latestLook.outfitCategory, !outfitCategory.isEmpty {
+                            Text(outfitCategory)
+                                .font(.system(size: metrics.value(13), weight: .semibold))
+                                .foregroundStyle(ClosetTheme.indigo)
+                                .padding(.horizontal, metrics.horizontalPadding)
+                        }
+                    }
+
+                    if !latestLook.tags.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: metrics.value(8)) {
+                                ForEach(latestLook.tags, id: \.self) { tag in
+                                    Text(tag)
+                                        .font(.system(size: metrics.value(11), weight: .semibold))
+                                        .foregroundStyle(ClosetTheme.textPrimary)
+                                        .padding(.horizontal, metrics.value(10))
+                                        .padding(.vertical, metrics.value(6))
+                                        .background(
+                                            Capsule()
+                                                .fill(ClosetTheme.secondaryCard)
+                                        )
+                                }
+                            }
+                            .padding(.horizontal, metrics.horizontalPadding)
+                        }
                     }
 
                     if !linkedItems.isEmpty {
-                        OutfitCanvasBoard(
-                            items: linkedItems,
-                            layouts: .constant(resolvedLayouts),
-                            metrics: metrics,
-                            isEditable: false
-                        )
-                        .frame(maxWidth: min(metrics.contentWidth * 0.9, metrics.value(320)))
-                        .frame(maxWidth: .infinity)
+                        TabView(selection: $selectedGalleryPageID) {
+                            ForEach(galleryPages) { page in
+                                OutfitDetailGalleryPage(
+                                    page: page,
+                                    look: latestLook,
+                                    linkedItems: linkedItems,
+                                    layouts: resolvedLayouts,
+                                    metrics: metrics,
+                                    detailImageWidth: detailImageWidth
+                                )
+                                .tag(page.id)
+                            }
+                        }
+                        .tabViewStyle(.page(indexDisplayMode: galleryPages.count > 1 ? .automatic : .never))
+                        .frame(height: detailImageWidth * 16 / 9 + metrics.value(40))
+
+                        HStack(spacing: metrics.value(10)) {
+                            PhotosPicker(selection: $selectedRealPhotoItem, matching: .images) {
+                                Label("导入真实照片", systemImage: "photo.badge.plus")
+                                    .font(.system(size: metrics.value(12), weight: .semibold))
+                                    .foregroundStyle(ClosetTheme.indigo)
+                                    .padding(.horizontal, metrics.value(12))
+                                    .frame(height: metrics.value(36))
+                                    .background(ClosetTheme.secondaryCard)
+                                    .clipShape(Capsule())
+                            }
+
+                            Button {
+                                let today = Calendar.current.startOfDay(for: .now)
+                                selectedRecordDate = today
+                                recordMonth = today
+                                isShowingRecordCalendar = true
+                            } label: {
+                                Label("记录", systemImage: "calendar.badge.plus")
+                                    .font(.system(size: metrics.value(12), weight: .semibold))
+                                    .foregroundStyle(ClosetTheme.textPrimary)
+                                    .padding(.horizontal, metrics.value(12))
+                                    .frame(height: metrics.value(36))
+                                    .background(ClosetTheme.secondaryCard)
+                                    .clipShape(Capsule())
+                            }
+
+                            Menu {
+                                ForEach(availableCoverOptions, id: \.source) { option in
+                                    Button {
+                                        store.setOutfitCoverSource(latestLook.id, source: option.source)
+                                        selectedGalleryPageID = pageID(for: option.source)
+                                    } label: {
+                                        if latestLook.coverImageSource == option.source {
+                                            Label(option.title, systemImage: "checkmark")
+                                        } else {
+                                            Text(option.title)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Label("设为封面", systemImage: "photo.on.rectangle")
+                                    .font(.system(size: metrics.value(12), weight: .semibold))
+                                    .foregroundStyle(ClosetTheme.textPrimary)
+                                    .padding(.horizontal, metrics.value(12))
+                                    .frame(height: metrics.value(36))
+                                    .background(ClosetTheme.secondaryCard)
+                                    .clipShape(Capsule())
+                            }
+                        }
                         .padding(.horizontal, metrics.horizontalPadding)
                     }
 
@@ -3606,13 +3840,29 @@ struct OutfitDetailSheet: View {
                             Text("AI 搭配解读")
                                 .font(.system(size: metrics.value(15), weight: .bold))
                                 .foregroundStyle(ClosetTheme.textPrimary)
-                            Text("这里预留给后续的 AI 搭配说明、风格建议和场景化文案。")
+                            Text(latestLook.aiSummary ?? "这套搭配已根据所选单品自动归类并生成标签，方便后续搜索、推荐和试穿展示。")
                                 .font(.system(size: metrics.value(13), weight: .medium))
                                 .foregroundStyle(ClosetTheme.textSecondary.opacity(0.76))
-                                .lineLimit(3)
+                                .lineLimit(4)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                            Color.clear
-                                .frame(height: metrics.value(28))
+
+                            if !latestLook.tags.isEmpty {
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    HStack(spacing: metrics.value(8)) {
+                                        ForEach(latestLook.tags, id: \.self) { tag in
+                                            Text(tag)
+                                                .font(.system(size: metrics.value(11), weight: .semibold))
+                                                .foregroundStyle(ClosetTheme.textPrimary)
+                                                .padding(.horizontal, metrics.value(10))
+                                                .padding(.vertical, metrics.value(6))
+                                                .background(
+                                                    Capsule()
+                                                        .fill(Color.white.opacity(0.78))
+                                                )
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     .padding(.horizontal, metrics.horizontalPadding)
@@ -3642,6 +3892,363 @@ struct OutfitDetailSheet: View {
             .sheet(isPresented: $isEditing) {
                 OutfitEditSheet(store: store, look: latestLook, metrics: metrics)
             }
+            .sheet(isPresented: $isShowingRecordCalendar) {
+                OutfitRecordCalendarSheet(
+                    store: store,
+                    look: latestLook,
+                    metrics: metrics,
+                    displayedMonth: $recordMonth,
+                    selectedDate: $selectedRecordDate
+                )
+            }
+            .task(id: selectedRealPhotoItem) {
+                guard let selectedRealPhotoItem else { return }
+                guard let photoData = try? await selectedRealPhotoItem.loadTransferable(type: Data.self) else { return }
+                let nextDraft = OutfitDraft(outfit: latestLook)
+                store.updateOutfit(latestLook.id, from: nextDraft, photoData: photoData)
+                if latestLook.coverImageSource == .realPhoto || latestLook.realPhotoFileName == nil {
+                    store.setOutfitCoverSource(latestLook.id, source: .realPhoto)
+                }
+                selectedGalleryPageID = OutfitGalleryPage.realPhoto.id
+                self.selectedRealPhotoItem = nil
+            }
+            .onAppear {
+                selectedGalleryPageID = preferredGalleryPageID(for: latestLook)
+            }
+        }
+    }
+
+    private var availableCoverOptions: [(source: OutfitCoverSource, title: String)] {
+        var options: [(OutfitCoverSource, String)] = [(.canvas, "幕布底稿")]
+        if latestLook.tryOnImageFileName != nil {
+            options.append((.tryOn, "AI 试穿图"))
+        }
+        if latestLook.realPhotoFileName != nil {
+            options.append((.realPhoto, "真实照片"))
+        }
+        return options
+    }
+
+    private func preferredGalleryPageID(for look: OutfitPreview) -> String {
+        pageID(for: look.coverImageSource, look: look)
+    }
+
+    private func pageID(for source: OutfitCoverSource, look: OutfitPreview? = nil) -> String {
+        let targetLook = look ?? latestLook
+        switch source {
+        case .canvas:
+            return OutfitGalleryPage.canvas.id
+        case .tryOn:
+            return targetLook.tryOnImageFileName == nil ? OutfitGalleryPage.canvas.id : OutfitGalleryPage.tryOn.id
+        case .realPhoto:
+            return targetLook.realPhotoFileName == nil ? OutfitGalleryPage.canvas.id : OutfitGalleryPage.realPhoto.id
+        }
+    }
+}
+
+private enum OutfitGalleryPage: String, Identifiable, CaseIterable {
+    case canvas
+    case tryOn
+    case realPhoto
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .canvas: "幕布底稿"
+        case .tryOn: "AI 试穿图"
+        case .realPhoto: "真实照片"
+        }
+    }
+}
+
+private struct OutfitDetailGalleryPage: View {
+    let page: OutfitGalleryPage
+    let look: OutfitPreview
+    let linkedItems: [ClosetItem]
+    let layouts: [OutfitItemLayout]
+    let metrics: LayoutMetrics
+    let detailImageWidth: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: metrics.value(8)) {
+            Text(page.title)
+                .font(.system(size: metrics.value(12), weight: .semibold))
+                .foregroundStyle(ClosetTheme.textSecondary)
+                .padding(.horizontal, metrics.horizontalPadding)
+
+            Group {
+                switch page {
+                case .canvas:
+                    OutfitCanvasBoard(
+                        items: linkedItems,
+                        layouts: .constant(layouts),
+                        metrics: metrics,
+                        isEditable: false
+                    )
+                    .frame(maxWidth: min(metrics.contentWidth * 0.9, metrics.value(320)))
+                    .frame(maxWidth: .infinity)
+                case .tryOn:
+                    if let image = LocalImageStore.shared.loadImage(named: look.tryOnImageFileName) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: detailImageWidth, height: detailImageWidth * 16 / 9)
+                            .clipShape(RoundedRectangle(cornerRadius: metrics.value(26), style: .continuous))
+                            .frame(maxWidth: .infinity)
+                    }
+                case .realPhoto:
+                    if let image = LocalImageStore.shared.loadImage(named: look.realPhotoFileName) {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: detailImageWidth, height: detailImageWidth * 16 / 9)
+                            .clipShape(RoundedRectangle(cornerRadius: metrics.value(26), style: .continuous))
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+            .padding(.horizontal, metrics.horizontalPadding)
+        }
+    }
+}
+
+private struct OutfitRecordCalendarSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var store: ClosetStore
+    let look: OutfitPreview
+    let metrics: LayoutMetrics
+    @Binding var displayedMonth: Date
+    @Binding var selectedDate: Date
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 7)
+
+    private var calendar: Calendar {
+        var value = Calendar(identifier: .gregorian)
+        value.locale = Locale(identifier: "zh_CN")
+        value.firstWeekday = 1
+        return value
+    }
+
+    private var today: Date {
+        calendar.startOfDay(for: .now)
+    }
+
+    private var monthStartDate: Date {
+        calendar.date(from: calendar.dateComponents([.year, .month], from: displayedMonth)) ?? displayedMonth
+    }
+
+    private var numberOfDays: Int {
+        calendar.range(of: .day, in: .month, for: displayedMonth)?.count ?? 30
+    }
+
+    private var leadingEmptyDays: Int {
+        max(calendar.component(.weekday, from: monthStartDate) - calendar.firstWeekday, 0)
+    }
+
+    private var calendarSlots: [Int?] {
+        let days = Array(repeating: Optional<Int>.none, count: leadingEmptyDays) + (1...numberOfDays).map(Optional.some)
+        let trailingCount = (7 - (days.count % 7)) % 7
+        return days + Array(repeating: Optional<Int>.none, count: trailingCount)
+    }
+
+    private var monthTitle: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年 M月"
+        return formatter.string(from: displayedMonth)
+    }
+
+    private var markers: [DiaryMarker] {
+        store.markers(for: displayedMonth)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: metrics.value(16)) {
+                VStack(alignment: .leading, spacing: metrics.value(6)) {
+                    Text("记录这套搭配")
+                        .font(.system(size: metrics.value(22), weight: .heavy))
+                        .foregroundStyle(ClosetTheme.textPrimary)
+                    Text("选择一个日期，将“\(look.title)”保存为当天的穿搭记录。")
+                        .font(.system(size: metrics.value(13), weight: .medium))
+                        .foregroundStyle(ClosetTheme.textSecondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, metrics.horizontalPadding)
+                .padding(.top, metrics.value(8))
+
+                FrostedCard(padding: 0) {
+                    VStack(spacing: 0) {
+                        VStack(spacing: metrics.value(14)) {
+                            HStack {
+                                Image(systemName: "chevron.left")
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .onTapGesture {
+                                        displayedMonth = calendar.date(byAdding: .month, value: -1, to: displayedMonth) ?? displayedMonth
+                                    }
+                                Spacer()
+                                Text(monthTitle)
+                                    .font(.system(size: metrics.value(24), weight: .heavy))
+                                    .foregroundStyle(.white)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .onTapGesture {
+                                        displayedMonth = calendar.date(byAdding: .month, value: 1, to: displayedMonth) ?? displayedMonth
+                                    }
+                            }
+                            .font(.system(size: metrics.value(24), weight: .semibold))
+
+                            HStack {
+                                ForEach(["日", "一", "二", "三", "四", "五", "六"], id: \.self) { day in
+                                    Text(day)
+                                        .frame(maxWidth: .infinity)
+                                        .font(.system(size: metrics.value(13), weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.82))
+                                }
+                            }
+                        }
+                        .padding(.horizontal, metrics.value(18))
+                        .padding(.top, metrics.value(18))
+                        .padding(.bottom, metrics.value(14))
+                        .background(ClosetTheme.accentGradient)
+
+                        LazyVGrid(columns: columns, spacing: 0) {
+                            ForEach(Array(calendarSlots.enumerated()), id: \.offset) { _, day in
+                                if let day {
+                                    let date = dateFor(day: day)
+                                    OutfitRecordCalendarDayCell(
+                                        day: day,
+                                        marker: markers.first(where: { $0.day == day }),
+                                        isSelected: calendar.isDate(date, inSameDayAs: selectedDate),
+                                        isToday: calendar.isDate(date, inSameDayAs: today),
+                                        metrics: metrics
+                                    )
+                                    .onTapGesture {
+                                        selectedDate = date
+                                    }
+                                } else {
+                                    OutfitRecordCalendarDayCell(
+                                        day: nil,
+                                        marker: nil,
+                                        isSelected: false,
+                                        isToday: false,
+                                        metrics: metrics
+                                    )
+                                }
+                            }
+                        }
+                        .background(Color.white.opacity(0.76))
+                    }
+                }
+                .padding(.horizontal, metrics.horizontalPadding)
+
+                Text("今日日期已标注“今日”，可直接选择当天或任意一天。")
+                    .font(.system(size: metrics.value(12), weight: .medium))
+                    .foregroundStyle(ClosetTheme.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, metrics.horizontalPadding)
+
+                HStack(spacing: metrics.value(12)) {
+                    Button("取消") {
+                        dismiss()
+                    }
+                    .font(.system(size: metrics.value(15), weight: .semibold))
+                    .foregroundStyle(ClosetTheme.textSecondary)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: metrics.value(48))
+                    .background(ClosetTheme.secondaryCard)
+                    .clipShape(RoundedRectangle(cornerRadius: metrics.value(16), style: .continuous))
+
+                    Button("保存到这一天") {
+                        store.recordOutfit(look.id, on: selectedDate)
+                        dismiss()
+                    }
+                    .font(.system(size: metrics.value(15), weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: metrics.value(48))
+                    .background(ClosetTheme.accentGradient)
+                    .clipShape(RoundedRectangle(cornerRadius: metrics.value(16), style: .continuous))
+                }
+                .padding(.horizontal, metrics.horizontalPadding)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.bottom, metrics.value(16))
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
+    private func dateFor(day: Int) -> Date {
+        calendar.date(byAdding: .day, value: day - 1, to: monthStartDate) ?? monthStartDate
+    }
+}
+
+private struct OutfitRecordCalendarDayCell: View {
+    let day: Int?
+    let marker: DiaryMarker?
+    let isSelected: Bool
+    let isToday: Bool
+    let metrics: LayoutMetrics
+
+    var body: some View {
+        VStack(spacing: metrics.value(4)) {
+            if let day {
+                VStack(spacing: metrics.value(2)) {
+                    Text("\(day)")
+                        .font(.system(size: metrics.value(14), weight: isSelected ? .bold : .medium))
+                        .foregroundStyle(ClosetTheme.textPrimary)
+                    if isToday {
+                        Text("今日")
+                            .font(.system(size: metrics.value(9), weight: .bold))
+                            .foregroundStyle(ClosetTheme.rose)
+                    } else {
+                        Spacer()
+                            .frame(height: metrics.value(10))
+                    }
+                }
+            } else {
+                Text("")
+                    .font(.system(size: metrics.value(14), weight: .medium))
+                    .hidden()
+            }
+
+            if let marker {
+                HStack(spacing: metrics.value(4)) {
+                    if marker.hasPhoto {
+                        Circle().fill(ClosetTheme.rose).frame(width: metrics.value(6), height: metrics.value(6))
+                    }
+                    if marker.hasOutfit {
+                        Circle().fill(ClosetTheme.indigo).frame(width: metrics.value(6), height: metrics.value(6))
+                    }
+                }
+                .frame(height: metrics.value(16))
+            } else {
+                Spacer()
+                    .frame(height: metrics.value(16))
+            }
+        }
+        .frame(height: metrics.value(58))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, metrics.value(2))
+        .background(isSelected ? ClosetTheme.indigo.opacity(0.08) : (isToday ? ClosetTheme.rose.opacity(0.06) : Color.clear))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(ClosetTheme.line.opacity(0.75))
+                .frame(height: 1)
+        }
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(ClosetTheme.line.opacity(0.75))
+                .frame(width: 1)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: metrics.value(14))
+                .stroke(isSelected ? ClosetTheme.indigo.opacity(0.9) : (isToday ? ClosetTheme.rose.opacity(0.9) : .clear), lineWidth: 2)
+                .padding(.horizontal, metrics.value(4))
+                .padding(.vertical, metrics.value(3))
         }
     }
 }
@@ -3654,6 +4261,8 @@ struct OutfitEditSheet: View {
     let metrics: LayoutMetrics
 
     @State private var draft = OutfitDraft()
+    @State private var isSaving = false
+    @State private var saveErrorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -3777,17 +4386,40 @@ struct OutfitEditSheet: View {
                     // ― Action buttons ――――――――――――――――――――――
                     HStack(spacing: 12) {
                         Button {
-                            store.updateOutfit(look.id, from: draft, photoData: nil)
-                            dismiss()
+                            guard !isSaving else { return }
+                            isSaving = true
+                            saveErrorMessage = nil
+                            Task {
+                                do {
+                                    try await store.updateOutfitWithGeneratedCover(look.id, from: draft)
+                                    await MainActor.run {
+                                        isSaving = false
+                                        dismiss()
+                                    }
+                                } catch {
+                                    await MainActor.run {
+                                        saveErrorMessage = error.localizedDescription
+                                        isSaving = false
+                                    }
+                                }
+                            }
                         } label: {
-                            Text("保存更改")
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 52)
-                                .background(ClosetTheme.accentGradient)
-                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                            HStack(spacing: metrics.value(8)) {
+                                if isSaving {
+                                    ProgressView()
+                                        .tint(.white)
+                                        .scaleEffect(0.9)
+                                }
+                                Text(isSaving ? "正在生成封面..." : "保存更改")
+                            }
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 52)
+                            .background(ClosetTheme.accentGradient)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
                         }
+                        .disabled(isSaving)
 
                         Button {
                             dismiss()
@@ -3800,6 +4432,7 @@ struct OutfitEditSheet: View {
                                 .background(ClosetTheme.secondaryCard)
                                 .clipShape(RoundedRectangle(cornerRadius: 16))
                         }
+                        .disabled(isSaving)
                     }
                     .padding(.horizontal, 20)
                     .padding(.top, 20)
@@ -3818,6 +4451,14 @@ struct OutfitEditSheet: View {
             }
             .navigationTitle("编辑搞配")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("保存搭配失败", isPresented: Binding(
+                get: { saveErrorMessage != nil },
+                set: { if !$0 { saveErrorMessage = nil } }
+            )) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text(saveErrorMessage ?? "请稍后重试。")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -3943,6 +4584,11 @@ struct TodayOutfitSection: View {
     }
 
     private var photoImage: UIImage? {
+        if let coverFileName = linkedOutfit?.photoFileName,
+           let image = LocalImageStore.shared.loadImage(named: coverFileName) {
+            return image
+        }
+
         guard let fileName = draft.photoFileName else { return nil }
         return LocalImageStore.shared.loadImage(named: fileName)
     }
@@ -3961,6 +4607,27 @@ struct TodayOutfitSection: View {
         return resolvedItemIDs.compactMap { id in
             store.wardrobeItems.first(where: { $0.id == id })
         }
+    }
+
+    private var linkedOutfit: OutfitPreview? {
+        guard let outfitID = draft.outfitID else { return nil }
+        return store.savedLooks.first(where: { $0.id == outfitID })
+    }
+
+    private var diaryPreviewWidth: CGFloat {
+        metrics.contentWidth * 0.36
+    }
+
+    private var diaryPreviewHeight: CGFloat {
+        diaryPreviewWidth * 16.0 / 9.0
+    }
+
+    private var garmentPreviewWidth: CGFloat {
+        metrics.value(88)
+    }
+
+    private var garmentPreviewHeight: CGFloat {
+        garmentPreviewWidth * 16.0 / 9.0
     }
 
     var body: some View {
@@ -4002,7 +4669,7 @@ struct TodayOutfitSection: View {
                                 .padding(metrics.value(12))
                             }
                         }
-                        .frame(width: metrics.contentWidth * 0.36, height: metrics.value(180))
+                        .frame(width: diaryPreviewWidth, height: diaryPreviewHeight)
                         .clipShape(RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous)
@@ -4039,7 +4706,7 @@ struct TodayOutfitSection: View {
                                                         imageFileName: item.imageFileName,
                                                         metrics: metrics
                                                     )
-                                                    .frame(width: metrics.value(94), height: metrics.value(126))
+                                                    .frame(width: garmentPreviewWidth, height: garmentPreviewHeight)
 
                                                     Text(item.name)
                                                         .font(.system(size: metrics.value(11), weight: .semibold))
@@ -4050,7 +4717,7 @@ struct TodayOutfitSection: View {
                                                         .font(.system(size: metrics.value(10), weight: .medium))
                                                         .foregroundStyle(ClosetTheme.textSecondary)
                                                 }
-                                                .frame(width: metrics.value(94), alignment: .leading)
+                                                .frame(width: garmentPreviewWidth, alignment: .leading)
                                             }
                                         }
                                         .padding(metrics.value(12))
@@ -4058,7 +4725,7 @@ struct TodayOutfitSection: View {
                                 }
                             }
                             .frame(maxWidth: .infinity)
-                            .frame(height: metrics.value(180))
+                            .frame(height: diaryPreviewHeight)
                             .overlay(
                                 RoundedRectangle(cornerRadius: metrics.value(22), style: .continuous)
                                     .stroke(.white.opacity(0.75), lineWidth: 1)
@@ -4313,6 +4980,9 @@ struct WardrobeItemSheet: View {
     @State private var isProcessingPhoto = false
     @State private var isAutoTagging = false
     @State private var photoProcessingStatus: LocalPhotoProcessingStatus?
+    @State private var aiAnalysis = ClothingAIAnalysis.empty
+
+    private let siliconFlowAutoTagService = SiliconFlowAutoTagService()
 
     private var isEditing: Bool { editingItem != nil }
 
@@ -4385,6 +5055,12 @@ struct WardrobeItemSheet: View {
                         .lineLimit(2, reservesSpace: true)
                 }
 
+                if aiAnalysis.hasContent {
+                    Section("AI 分析") {
+                        AIAnalysisReadonlySection(analysis: aiAnalysis)
+                    }
+                }
+
                 if let errorMessage = viewModel.errorMessage {
                     Section {
                         Text(errorMessage)
@@ -4436,13 +5112,7 @@ struct WardrobeItemSheet: View {
                 let result = await BackgroundRemovalService.shared.prepareWardrobeImage(from: rawData)
                 selectedPhotoData = result.imageData
                 detectedImageBase64 = result.imageData.base64EncodedString()
-                photoProcessingStatus = LocalPhotoProcessingStatus(
-                    message: result.localizedStatusMessage,
-                    tone: result.didRemoveBackground ? .success : .info,
-                    detail: result.didRemoveBackground
-                        ? "图片已在本地优化，可继续自动识别或直接保存。"
-                        : (result.localizedFailureDetail ?? "当前图片保留原图继续使用，不影响后续录入。")
-                )
+                await autoTagSelectedPhoto(with: result)
             }
         }
     }
@@ -4477,6 +5147,7 @@ struct WardrobeItemSheet: View {
             hasPurchaseDate = true
         }
         tagsText = editingItem.tags.joined(separator: ", ")
+        aiAnalysis = editingItem.aiAnalysis ?? .empty
         selectedPhotoData = nil
         detectedImageBase64 = editingItem.imageFront
         photoProcessingStatus = nil
@@ -4488,6 +5159,72 @@ struct WardrobeItemSheet: View {
         if let color = response.color, !color.isEmpty { self.color = color }
         if let brand = response.brand, !brand.isEmpty { self.brand = brand }
         if let tags = response.tags, !tags.isEmpty { self.tagsText = tags.joined(separator: ", ") }
+        aiAnalysis = response.aiAnalysis ?? .empty
+    }
+
+    private func applyLocalAutoTag(_ result: LocalClothingAutoTagResult) {
+        if result.confidence >= 0.55 {
+            category = result.category
+        }
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isEditing {
+            name = result.suggestedName
+        }
+        if color.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isEditing {
+            color = result.color
+        }
+        tagsText = mergeTags(existing: tagsText.tagList, localTags: result.tags).joined(separator: ", ")
+    }
+
+    private func mergeTags(existing: [String], localTags: [String]) -> [String] {
+        var ordered: [String] = []
+        for tag in localTags + existing {
+            guard !tag.isEmpty, !ordered.contains(tag) else { continue }
+            ordered.append(tag)
+        }
+        return ordered
+    }
+
+    @MainActor
+    private func autoTagSelectedPhoto(with result: BackgroundRemovalResult) async {
+        let localAutoTag = await LocalClothingTypeRecognizer.shared.recognizeAttributes(from: UIImage(data: result.imageData))
+
+        guard let detectedImageBase64 else {
+            applyLocalAutoTag(localAutoTag)
+            photoProcessingStatus = LocalPhotoProcessingStatus(
+                message: "已本地识别为\(localAutoTag.color)\(localAutoTag.typeName)",
+                tone: result.didRemoveBackground ? .success : .info,
+                detail: "图片已完成本地处理，并使用本地识别填充基础信息。"
+            )
+            return
+        }
+
+        isAutoTagging = true
+        defer { isAutoTagging = false }
+
+        do {
+            let response = try await siliconFlowAutoTagService.autoTag(imageBase64: detectedImageBase64)
+            applyAutoTag(response)
+            let resolvedName = response.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? response.name!
+                : localAutoTag.suggestedName
+            let resolvedColor = response.color?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? response.color!
+                : localAutoTag.color
+            photoProcessingStatus = LocalPhotoProcessingStatus(
+                message: "已用大模型识别为\(resolvedColor)\(resolvedName)",
+                tone: result.didRemoveBackground ? .success : .info,
+                detail: result.didRemoveBackground
+                    ? "图片已本地优化，并默认使用 Qwen2.5-VL 自动填充分类、颜色、名称、品牌和标签。"
+                    : (result.localizedFailureDetail ?? "当前图片保留原图继续使用，已默认使用 Qwen2.5-VL 自动填充基础信息。")
+            )
+        } catch {
+            applyLocalAutoTag(localAutoTag)
+            photoProcessingStatus = LocalPhotoProcessingStatus(
+                message: "大模型识别失败，已回退为本地识别：\(localAutoTag.color)\(localAutoTag.typeName)",
+                tone: .info,
+                detail: error.localizedDescription
+            )
+        }
     }
 }
 
@@ -4803,6 +5540,8 @@ struct AddItemSheet: View {
     @State private var selectedPhotoData: Data?
     @State private var isPreparingPhotos = false
 
+    private let siliconFlowAutoTagService = SiliconFlowAutoTagService()
+
     private var isEditing: Bool { editingItem != nil }
     private var isBatchImport: Bool { !isEditing && importedDrafts.count > 1 }
     private var currentImportedDraft: ImportedItemDraft? {
@@ -4896,6 +5635,12 @@ struct AddItemSheet: View {
                     BrandPickerField(label: "品牌（可不填）", text: draftBinding(\.brand))
                     TextField("价格（可不填）", text: draftBinding(\.price))
                         .keyboardType(.numberPad)
+                }
+
+                if currentDraft.aiAnalysis.hasContent {
+                    Section("AI 分析") {
+                        AIAnalysisReadonlySection(analysis: currentDraft.aiAnalysis)
+                    }
                 }
             }
             .navigationTitle(isEditing ? "编辑单品" : "新增单品")
@@ -5004,6 +5749,7 @@ struct AddItemSheet: View {
             draft.brand = detection.brand
         }
         draft.gradientName = GarmentGradient(rawValue: detection.section.defaultGradientName) ?? draft.gradientName
+        draft.aiAnalysis = detection.aiAnalysis
     }
 
     @MainActor
@@ -5025,29 +5771,60 @@ struct AddItemSheet: View {
         draft.color = detection.color
         draft.brand = detection.brand
         draft.gradientName = GarmentGradient(rawValue: detection.section.defaultGradientName) ?? .mist
+        draft.aiAnalysis = detection.aiAnalysis
         return ImportedItemDraft(photoData: result.imageData, draft: draft)
     }
 
     private func detectPhotoMetadata(for data: Data) async -> BatchPhotoDetectionResult {
         let image = UIImage(data: data)
-        let recognition = await LocalClothingTypeRecognizer.shared.recognizeSection(from: image)
-        let section = recognition.isConfident ? (recognition.section ?? .uncategorized) : .uncategorized
-        let color = WardrobeSection.heuristicColorName(for: image)
-        return BatchPhotoDetectionResult(
-            section: section,
-            name: WardrobeSection.localizedDefaultItemName(for: section, colorName: color),
-            color: color,
-            brand: "",
-            categoryRecognitionLabel: recognitionLabel(for: recognition),
-            categoryWasAutoDetected: section != .uncategorized
-        )
+        let localAutoTag = await LocalClothingTypeRecognizer.shared.recognizeAttributes(from: image)
+        let imageBase64 = data.base64EncodedString()
+
+        do {
+            let response = try await siliconFlowAutoTagService.autoTag(imageBase64: imageBase64)
+            let resolvedSection = section(from: response.category) ?? localAutoTag.section
+            let resolvedName = nonEmpty(response.name) ?? localAutoTag.suggestedName
+            let resolvedColor = nonEmpty(response.color) ?? localAutoTag.color
+            let resolvedBrand = nonEmpty(response.brand) ?? ""
+
+            return BatchPhotoDetectionResult(
+                section: resolvedSection,
+                name: resolvedName,
+                color: resolvedColor,
+                brand: resolvedBrand,
+                aiAnalysis: response.aiAnalysis ?? .empty,
+                categoryRecognitionLabel: "AI 识别: \(resolvedColor)\(resolvedName)",
+                categoryWasAutoDetected: response.category != nil
+            )
+        } catch {
+            return BatchPhotoDetectionResult(
+                section: localAutoTag.section,
+                name: localAutoTag.suggestedName,
+                color: localAutoTag.color,
+                brand: "",
+                aiAnalysis: .empty,
+                categoryRecognitionLabel: recognitionLabel(for: localAutoTag),
+                categoryWasAutoDetected: localAutoTag.confidence >= 0.55
+            )
+        }
     }
 
-    private func recognitionLabel(for recognition: LocalClothingTypeRecognition) -> String {
-        guard recognition.isConfident, let section = recognition.section else {
+    private func section(from category: ClothingCategory?) -> WardrobeSection? {
+        guard let category else { return nil }
+        return WardrobeSection(category: category)
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func recognitionLabel(for result: LocalClothingAutoTagResult) -> String {
+        guard result.confidence >= 0.55 else {
             return "未分类"
         }
-        return "本地识别: \(section.rawValue)"
+        return "本地识别: \(result.color)\(result.typeName)"
     }
 
     private func normalizedDraftForSave(_ input: AddItemDraft) -> AddItemDraft {
@@ -5108,8 +5885,55 @@ private struct BatchPhotoDetectionResult {
     let name: String
     let color: String
     let brand: String
+    let aiAnalysis: ClothingAIAnalysis
     let categoryRecognitionLabel: String
     let categoryWasAutoDetected: Bool
+}
+
+private struct AIAnalysisReadonlySection: View {
+    let analysis: ClothingAIAnalysis
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            aiRow("风格", values: analysis.style)
+            aiRow("季节", values: analysis.seasons)
+            aiRow("材质", values: analysis.materials)
+            aiRow("版型", value: analysis.silhouette)
+            aiRow("图案", value: analysis.pattern)
+            aiRow("场合", values: analysis.occasions)
+            aiRow("正式度", value: analysis.formality)
+            aiRow("保暖度", value: analysis.warmth)
+        }
+        .font(.system(size: 13, weight: .medium))
+    }
+
+    @ViewBuilder
+    private func aiRow(_ title: String, values: [String]) -> some View {
+        if !values.isEmpty {
+            HStack(alignment: .top, spacing: 12) {
+                Text(title)
+                    .foregroundStyle(ClosetTheme.textSecondary)
+                    .frame(width: 56, alignment: .leading)
+                Text(values.joined(separator: "、"))
+                    .foregroundStyle(ClosetTheme.textPrimary)
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func aiRow(_ title: String, value: String?) -> some View {
+        if let value, !value.isEmpty {
+            HStack(alignment: .top, spacing: 12) {
+                Text(title)
+                    .foregroundStyle(ClosetTheme.textSecondary)
+                    .frame(width: 56, alignment: .leading)
+                Text(value)
+                    .foregroundStyle(ClosetTheme.textPrimary)
+                Spacer(minLength: 0)
+            }
+        }
+    }
 }
 
 private struct DuplicateWarningCard: View {
@@ -5914,7 +6738,7 @@ private extension ClothingCategory {
     }
 }
 
-private extension WardrobeSection {
+extension WardrobeSection {
     init(category: ClothingCategory) {
         switch category {
         case .top, .outerwear, .accessory:
@@ -5949,21 +6773,32 @@ private extension WardrobeSection {
 
     static func heuristicColorName(for image: UIImage?) -> String {
         guard let image else { return "基础色" }
-        let sample = image.averageColorComponents
+        let sample = image.dominantForegroundColorComponents
         let brightness = (sample.red + sample.green + sample.blue) / 3
         let saturation = max(sample.red, max(sample.green, sample.blue)) - min(sample.red, min(sample.green, sample.blue))
 
-        if brightness < 0.2 { return "黑色" }
-        if brightness > 0.88 && saturation < 0.12 { return "白色" }
-        if saturation < 0.1 { return brightness > 0.55 ? "灰色" : "深灰色" }
-        if sample.red > sample.green * 1.18 && sample.red > sample.blue * 1.18 {
-            return sample.green > 0.55 ? "米色" : "红色"
+        if brightness < 0.18 { return "黑色" }
+        if brightness > 0.9 && saturation < 0.1 { return "白色" }
+        if saturation < 0.08 {
+            if brightness > 0.72 { return "浅灰色" }
+            if brightness > 0.42 { return "灰色" }
+            return "深灰色"
         }
-        if sample.blue > sample.red * 1.12 && sample.blue > sample.green * 1.08 {
+        if sample.red > sample.green * 1.18 && sample.red > sample.blue * 1.18 {
+            if brightness > 0.7 && saturation < 0.28 { return "米色" }
+            if sample.green > sample.blue * 1.08 && brightness > 0.45 { return "棕色" }
+            return "红色"
+        }
+        if sample.blue > sample.red * 1.08 && sample.blue > sample.green * 1.03 {
+            if brightness < 0.38 { return "深蓝色" }
+            if brightness > 0.7 { return "浅蓝色" }
             return "蓝色"
         }
         if sample.green > sample.red * 1.08 && sample.green > sample.blue * 1.08 {
             return "绿色"
+        }
+        if sample.red > 0.45 && sample.green > 0.34 && sample.blue < 0.26 {
+            return "棕色"
         }
         return brightness > 0.7 ? "浅色" : "深色"
     }
@@ -5990,6 +6825,131 @@ private extension WardrobeSection {
 }
 
 extension UIImage {
+    var dominantForegroundColorComponents: (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        guard let cgImage else { return averageColorComponents }
+
+        let width = 48
+        let height = 48
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
+
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return averageColorComponents
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var redTotal: CGFloat = 0
+        var greenTotal: CGFloat = 0
+        var blueTotal: CGFloat = 0
+        var weightTotal: CGFloat = 0
+
+        for index in stride(from: 0, to: pixels.count, by: bytesPerPixel) {
+            let red = CGFloat(pixels[index]) / 255
+            let green = CGFloat(pixels[index + 1]) / 255
+            let blue = CGFloat(pixels[index + 2]) / 255
+            let alpha = CGFloat(pixels[index + 3]) / 255
+            let brightness = (red + green + blue) / 3
+            let saturation = max(red, max(green, blue)) - min(red, min(green, blue))
+
+            guard alpha > 0.18 else { continue }
+            guard !(brightness > 0.95 && saturation < 0.04) else { continue }
+
+            let colorWeight = max(0.18, saturation * 1.35 + alpha * 0.9)
+            redTotal += red * colorWeight
+            greenTotal += green * colorWeight
+            blueTotal += blue * colorWeight
+            weightTotal += colorWeight
+        }
+
+        guard weightTotal > 0.01 else { return averageColorComponents }
+        return (redTotal / weightTotal, greenTotal / weightTotal, blueTotal / weightTotal)
+    }
+
+    var foregroundSilhouetteMetrics: ForegroundSilhouetteMetrics {
+        guard let cgImage else { return ForegroundSilhouetteMetrics.fallback(for: size) }
+
+        let width = 48
+        let height = 64
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
+
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return ForegroundSilhouetteMetrics.fallback(for: size)
+        }
+
+        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        var minX = width
+        var minY = height
+        var maxX = 0
+        var maxY = 0
+        var topHalfCount = 0
+        var bottomHalfCount = 0
+        var topWidth = 0
+        var bottomWidth = 0
+
+        for y in 0..<height {
+            var rowCount = 0
+            for x in 0..<width {
+                let index = (y * width + x) * bytesPerPixel
+                let alpha = CGFloat(pixels[index + 3]) / 255
+                guard alpha > 0.18 else { continue }
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+                rowCount += 1
+                if y < height / 2 {
+                    topHalfCount += 1
+                } else {
+                    bottomHalfCount += 1
+                }
+            }
+
+            if y < height / 2 {
+                topWidth = max(topWidth, rowCount)
+            } else {
+                bottomWidth = max(bottomWidth, rowCount)
+            }
+        }
+
+        guard minX <= maxX, minY <= maxY else {
+            return ForegroundSilhouetteMetrics.fallback(for: size)
+        }
+
+        let visibleWidth = max(CGFloat(maxX - minX + 1), 1)
+        let visibleHeight = max(CGFloat(maxY - minY + 1), 1)
+        let visibleCount = max(CGFloat(topHalfCount + bottomHalfCount), 1)
+
+        return ForegroundSilhouetteMetrics(
+            widthToHeightRatio: visibleWidth / visibleHeight,
+            heightToWidthRatio: visibleHeight / visibleWidth,
+            topHalfFillRatio: CGFloat(topHalfCount) / visibleCount,
+            bottomHalfFillRatio: CGFloat(bottomHalfCount) / visibleCount,
+            topWidthRatio: CGFloat(topWidth) / CGFloat(width),
+            bottomWidthRatio: CGFloat(bottomWidth) / CGFloat(width)
+        )
+    }
+
     var averageColorComponents: (red: CGFloat, green: CGFloat, blue: CGFloat) {
         guard let inputImage = CIImage(image: self) else { return (0.8, 0.8, 0.8) }
         let extent = inputImage.extent
@@ -6102,6 +7062,28 @@ extension UIImage {
         let g = CGFloat(data[offset + 1]) / 255
         let b = CGFloat(data[offset + 2]) / 255
         return 0.299 * r + 0.587 * g + 0.114 * b
+    }
+}
+
+struct ForegroundSilhouetteMetrics {
+    let widthToHeightRatio: CGFloat
+    let heightToWidthRatio: CGFloat
+    let topHalfFillRatio: CGFloat
+    let bottomHalfFillRatio: CGFloat
+    let topWidthRatio: CGFloat
+    let bottomWidthRatio: CGFloat
+
+    static func fallback(for size: CGSize) -> ForegroundSilhouetteMetrics {
+        let width = max(size.width, 1)
+        let height = max(size.height, 1)
+        return ForegroundSilhouetteMetrics(
+            widthToHeightRatio: width / height,
+            heightToWidthRatio: height / width,
+            topHalfFillRatio: 0.5,
+            bottomHalfFillRatio: 0.5,
+            topWidthRatio: 0.5,
+            bottomWidthRatio: 0.5
+        )
     }
 }
 

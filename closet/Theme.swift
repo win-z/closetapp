@@ -55,6 +55,8 @@ struct LayoutMetrics {
     var tabBarHeight: CGFloat { 88 * scale }
     var tabBarBottomPadding: CGFloat { max(10, safeBottom == 0 ? 12 : safeBottom - 2) }
     var tabInsetHeight: CGFloat { tabBarHeight + tabBarBottomPadding + 22 }
+    var floatingActionBottomPadding: CGFloat { tabBarHeight + max(6, tabBarBottomPadding * 0.45) }
+    var floatingPopoverBottomPadding: CGFloat { floatingActionBottomPadding + 46 * scale }
 
     func value(_ raw: CGFloat) -> CGFloat {
         raw * scale

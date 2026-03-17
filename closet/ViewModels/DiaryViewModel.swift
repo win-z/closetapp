@@ -93,11 +93,13 @@ final class DiaryViewModel: ObservableObject {
         entries.compactMap { entry in
             guard let parsedDate = apiDate(entry.date) else { return nil }
             guard calendar.isDate(parsedDate, equalTo: month, toGranularity: .month) else { return nil }
+            let hasOutfit = entry.outfitId?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || !entry.clothingIds.isEmpty
             return DiaryMarker(
                 day: calendar.component(.day, from: parsedDate),
                 hasRecord: true,
                 hasPhoto: entry.photo?.isEmpty == false,
-                hasOutfit: entry.outfitId != nil,
+                hasOutfit: hasOutfit,
                 mood: entry.mood
             )
         }

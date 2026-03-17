@@ -6,10 +6,12 @@
 //
 
 import Foundation
+import OSLog
 
 struct DoubaoOutfitImageService {
     private let session: URLSession
     private let environment: AppEnvironment.Configuration
+    private let logger = Logger(subsystem: "winz.closet", category: "DoubaoOutfitImage")
 
     init(
         session: URLSession = .shared,
@@ -30,15 +32,20 @@ struct DoubaoOutfitImageService {
         }
 
         let referenceImages = try makeReferenceImages(profile: profile, items: items)
+        let finalPrompt = makePrompt(prompt: prompt, profile: profile, weather: weather, items: items)
         let requestBody = DoubaoGenerationRequest(
             model: environment.doubaoModel,
-            prompt: makePrompt(prompt: prompt, profile: profile, weather: weather, items: items),
+            prompt: finalPrompt,
             size: "2K",
             responseFormat: "url",
             image: referenceImages,
+            stream: false,
             watermark: false,
             sequentialImageGeneration: "disabled"
         )
+
+        logger.info("Doubao request start model=\(self.environment.doubaoModel, privacy: .public) images=\(referenceImages.count) bodyPhotos=\(self.availableBodyPhotoCount(profile: profile)) items=\(items.count)")
+        logger.debug("Doubao prompt: \(finalPrompt, privacy: .public)")
 
         let endpoint = environment.doubaoAPIURL.appending(path: "images/generations")
         var request = URLRequest(url: endpoint)
@@ -54,35 +61,46 @@ struct DoubaoOutfitImageService {
         do {
             (responseData, response) = try await session.data(for: request)
         } catch {
-            throw DoubaoOutfitImageError.transport(error.localizedDescription)
+            logger.error("Doubao request transport error: \(error.localizedDescription, privacy: .public)")
+            throw DoubaoOutfitImageError.transport(networkErrorDescription(from: error))
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            logger.error("Doubao invalid response object")
             throw DoubaoOutfitImageError.invalidResponse
         }
 
+        logger.info("Doubao response status=\(httpResponse.statusCode)")
+
         guard 200 ... 299 ~= httpResponse.statusCode else {
             let message = parseErrorMessage(from: responseData)
+            logger.error("Doubao server error status=\(httpResponse.statusCode) message=\(message ?? "nil", privacy: .public)")
             throw DoubaoOutfitImageError.server(statusCode: httpResponse.statusCode, message: message)
         }
 
         let payload = try JSONDecoder().decode(DoubaoGenerationResponse.self, from: responseData)
+        logger.info("Doubao response decoded images=\(payload.data.count)")
 
         if let first = payload.data.first {
             if let imageURLString = first.url, let imageURL = URL(string: imageURLString) {
+                logger.info("Doubao image url received")
                 do {
                     let (imageData, _) = try await session.data(from: imageURL)
+                    logger.info("Doubao image download success bytes=\(imageData.count)")
                     return imageData
                 } catch {
-                    throw DoubaoOutfitImageError.transport(error.localizedDescription)
+                    logger.error("Doubao image download error: \(error.localizedDescription, privacy: .public)")
+                    throw DoubaoOutfitImageError.transport(networkErrorDescription(from: error))
                 }
             }
 
             if let base64 = first.b64Json, let imageData = Data(base64Encoded: base64) {
+                logger.info("Doubao base64 image received bytes=\(imageData.count)")
                 return imageData
             }
         }
 
+        logger.error("Doubao empty result")
         throw DoubaoOutfitImageError.emptyResult
     }
 
@@ -114,46 +132,50 @@ struct DoubaoOutfitImageService {
         weather: WeatherSnapshot,
         items: [ClosetItem]
     ) -> String {
-        let itemLines = items.map { item in
-            "- \(item.section.rawValue)：\(item.name)，颜色\(item.color)，品牌\(item.brand)"
-        }.joined(separator: "\n")
-
-        let bodyPhotoTitles = profile.bodyPhotos
-            .filter { $0.imageFileName != nil }
-            .map(\.title)
-            .joined(separator: "、")
-
         let userPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let customRequirement = userPrompt.isEmpty ? "自然、真实、适合日常穿搭展示" : userPrompt
+        let bodyPhotos = profile.bodyPhotos.filter { $0.imageFileName != nil }
+        let bodyPhotoLines = bodyPhotos.enumerated().map { index, photo in
+            "图\(index + 1)是用户的\(photo.title)全身参考图。"
+        }.joined(separator: "\n")
+        let clothingStartIndex = bodyPhotos.count + 1
+        let clothingLines = items.enumerated().map { index, item in
+            "图\(clothingStartIndex + index)是要穿在人物身上的\(item.section.rawValue)，名称\(item.name)，颜色\(item.color)，品牌\(item.brand)。"
+        }.joined(separator: "\n")
+        let clothingAnalysisLines = items.enumerated().map { index, item in
+            "图\(clothingStartIndex + index)的AI分析：\(aiAnalysisSummary(for: item.aiAnalysis))"
+        }.joined(separator: "\n")
+        let outfitInstruction = items.enumerated().map { index, item in
+            "将图\(clothingStartIndex + index)中的\(item.name)穿在同一个人物身上。"
+        }.joined(separator: "\n")
 
         return """
-        你是一名电商视觉造型师，请根据参考图生成一张真实自然的 AI 穿搭展示图。
+        虚拟试穿照片生成任务。
 
-        【人物要求】
-        保持同一个人的面部特征、发型、肤色和身材比例一致。
-        已提供的人体参考角度：\(bodyPhotoTitles.isEmpty ? "正面" : bodyPhotoTitles)。
+        【人物一致性要求 - 必须严格遵守】
+        \(bodyPhotoLines)
+        以上参考图都是同一个用户的三视图或多视角照片。
+        生成结果必须保持这个人的面部特征、五官细节、发型发色、身材比例、身高体型、肤色完全一致，不能替换成其他人。
 
-        【用户档案】
-        - 昵称：\(profile.name)
-        - 身高：\(profile.heightCm)cm
-        - 体重：\(profile.weightKg)kg
+        【服装参考图】
+        \(clothingLines)
+        \(clothingAnalysisLines)
 
-        【天气场景】
-        - 地点：\(weather.location)
-        - 天气：\(weather.condition)
-        - 温度：\(weather.temperature)°C
-        - 体感：\(weather.feelsLike)°C
+        【试穿要求】
+        \(outfitInstruction)
+        最终人物必须穿的是当前搭配里的这些衣服，不允许替换成其他款式，不允许改变服装主颜色、版型、材质和关键细节。
 
-        【服装要求】
-        严格使用参考服装，保持款式、颜色、材质和轮廓一致：
-        \(itemLines)
+        【用户与场景补充】
+        用户昵称：\(profile.name)
+        身高：\(profile.heightCm)cm
+        体重：\(profile.weightKg)kg
+        天气：\(weather.location)，\(weather.condition)，\(weather.temperature)°C，体感\(weather.feelsLike)°C
+        用户要求：\(customRequirement)
 
-        【画面要求】
-        - 生成 9:16 竖图
-        - 全身完整出镜，人物位于画面中间
-        - 背景简洁干净，适合穿搭展示
-        - 光线自然，服装纹理清晰
-        - 整体风格：\(customRequirement)
+        【输出要求】
+        生成 9:16 竖图，适合作为已保存搭配的试穿封面。
+        人物站在画面正中间，全身完整显示，正面朝向镜头。
+        背景简洁干净，自然光照，服装纹理清晰，整体效果真实自然。
         """
     }
 
@@ -163,6 +185,42 @@ struct DoubaoOutfitImageService {
         }
 
         return String(data: data, encoding: .utf8)
+    }
+
+    private func networkErrorDescription(from error: Error) -> String {
+        guard let urlError = error as? URLError else {
+            return error.localizedDescription
+        }
+
+        switch urlError.code {
+        case .cannotFindHost, .dnsLookupFailed, .cannotConnectToHost:
+            return "当前网络无法解析或连接豆包域名，请检查设备网络、DNS、代理或地区访问限制。"
+        case .notConnectedToInternet:
+            return "当前设备未连接互联网，请检查网络后重试。"
+        case .timedOut:
+            return "请求豆包超时，请稍后重试。"
+        default:
+            return urlError.localizedDescription
+        }
+    }
+
+    private func availableBodyPhotoCount(profile: ProfileData) -> Int {
+        profile.bodyPhotos.filter { $0.imageFileName != nil }.count
+    }
+
+    private func aiAnalysisSummary(for analysis: ClothingAIAnalysis) -> String {
+        guard analysis.hasContent else { return "暂无额外分析信息。" }
+
+        var parts: [String] = []
+        if !analysis.style.isEmpty { parts.append("风格：\(analysis.style.joined(separator: "、"))") }
+        if !analysis.seasons.isEmpty { parts.append("季节：\(analysis.seasons.joined(separator: "、"))") }
+        if !analysis.materials.isEmpty { parts.append("材质：\(analysis.materials.joined(separator: "、"))") }
+        if let silhouette = analysis.silhouette, !silhouette.isEmpty { parts.append("版型：\(silhouette)") }
+        if let pattern = analysis.pattern, !pattern.isEmpty { parts.append("图案：\(pattern)") }
+        if !analysis.occasions.isEmpty { parts.append("场合：\(analysis.occasions.joined(separator: "、"))") }
+        if let formality = analysis.formality, !formality.isEmpty { parts.append("正式度：\(formality)") }
+        if let warmth = analysis.warmth, !warmth.isEmpty { parts.append("保暖度：\(warmth)") }
+        return parts.joined(separator: "；")
     }
 }
 
@@ -198,6 +256,7 @@ private struct DoubaoGenerationRequest: Encodable {
     let size: String
     let responseFormat: String
     let image: [String]
+    let stream: Bool
     let watermark: Bool
     let sequentialImageGeneration: String
 
@@ -207,6 +266,7 @@ private struct DoubaoGenerationRequest: Encodable {
         case size
         case responseFormat = "response_format"
         case image
+        case stream
         case watermark
         case sequentialImageGeneration = "sequential_image_generation"
     }

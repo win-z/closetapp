@@ -6,10 +6,12 @@
 //
 
 import Foundation
+import OSLog
 
 struct SiliconFlowAutoTagService {
     private let session: URLSession
     private let environment: AppEnvironment.Configuration
+    private let logger = Logger(subsystem: "winz.closet", category: "SiliconFlowAutoTag")
 
     init(
         session: URLSession = .shared,
@@ -35,12 +37,22 @@ struct SiliconFlowAutoTagService {
           "color": "主色调",
           "category": "上装/下装/连衣裙/外套/鞋履/配饰",
           "brand": "品牌名称或 null",
-          "tags": ["风格1", "季节1", "材质1", "场合1"]
+          "tags": ["风格1", "季节1", "材质1", "场合1"],
+          "style": ["简约", "通勤"],
+          "seasons": ["春", "秋"],
+          "materials": ["牛仔", "针织"],
+          "silhouette": "直筒/修身/A字/宽松/廓形",
+          "pattern": "纯色/条纹/格纹/印花/拼接",
+          "occasions": ["通勤", "日常", "约会"],
+          "formality": "休闲/轻通勤/正式",
+          "warmth": "轻薄/适中/保暖"
         }
 
         要求：
         - 如果品牌无法识别，返回 null
         - category 必须从固定枚举中选
+        - style、seasons、materials、occasions 返回最相关的 1-3 项
+        - silhouette、pattern、formality、warmth 无法判断时返回 null
         - 只返回 JSON
         """
 
@@ -68,25 +80,33 @@ struct SiliconFlowAutoTagService {
         request.setValue("Bearer \(environment.siliconFlowAPIKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONEncoder().encode(body)
 
+        logger.info("SiliconFlow request start model=\(self.environment.siliconFlowVisionModel, privacy: .public) imageIsDataURL=\(normalizedImage.hasPrefix("data:image")) imageLength=\(normalizedImage.count)")
+
         let responseData: Data
         let response: URLResponse
         do {
             (responseData, response) = try await session.data(for: request)
         } catch {
-            throw SiliconFlowAutoTagError.transport(error.localizedDescription)
+            logger.error("SiliconFlow transport error: \(error.localizedDescription, privacy: .public)")
+            throw SiliconFlowAutoTagError.transport(networkErrorDescription(from: error))
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            logger.error("SiliconFlow invalid response object")
             throw SiliconFlowAutoTagError.invalidResponse
         }
 
+        logger.info("SiliconFlow response status=\(httpResponse.statusCode)")
+
         guard 200 ... 299 ~= httpResponse.statusCode else {
             let serverMessage = parseServerMessage(from: responseData)
+            logger.error("SiliconFlow server error status=\(httpResponse.statusCode) message=\(serverMessage ?? "nil", privacy: .public)")
             throw SiliconFlowAutoTagError.server(statusCode: httpResponse.statusCode, message: serverMessage)
         }
 
         let payload = try JSONDecoder().decode(SiliconFlowChatResponse.self, from: responseData)
         guard let content = payload.choices.first?.message.content?.nilIfBlank else {
+            logger.error("SiliconFlow empty result")
             throw SiliconFlowAutoTagError.emptyResult
         }
 
@@ -97,6 +117,7 @@ struct SiliconFlowAutoTagService {
         }
 
         let decoded = try JSONDecoder().decode(SiliconFlowAutoTagPayload.self, from: jsonData)
+        logger.info("SiliconFlow parsed category=\(decoded.category ?? "nil", privacy: .public) name=\(decoded.name ?? "nil", privacy: .public) color=\(decoded.color ?? "nil", privacy: .public)")
         return decoded.normalized
     }
 
@@ -114,6 +135,23 @@ struct SiliconFlowAutoTagService {
             return payload.error?.message ?? payload.message
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func networkErrorDescription(from error: Error) -> String {
+        guard let urlError = error as? URLError else {
+            return error.localizedDescription
+        }
+
+        switch urlError.code {
+        case .cannotFindHost, .dnsLookupFailed, .cannotConnectToHost:
+            return "当前网络无法解析或连接硅基流动域名，请检查设备网络、DNS、代理或地区访问限制。"
+        case .notConnectedToInternet:
+            return "当前设备未连接互联网，请检查网络后重试。"
+        case .timedOut:
+            return "请求硅基流动超时，请稍后重试。"
+        default:
+            return urlError.localizedDescription
+        }
     }
 }
 
@@ -213,6 +251,14 @@ private struct SiliconFlowAutoTagPayload: Decodable {
     let category: String?
     let brand: String?
     let tags: [String]?
+    let style: [String]?
+    let seasons: [String]?
+    let materials: [String]?
+    let silhouette: String?
+    let pattern: String?
+    let occasions: [String]?
+    let formality: String?
+    let warmth: String?
 
     var normalized: AutoTagResponse {
         AutoTagResponse(
@@ -220,7 +266,17 @@ private struct SiliconFlowAutoTagPayload: Decodable {
             name: name?.nilIfBlank,
             color: color?.nilIfBlank,
             brand: brandValue,
-            tags: tags?.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            tags: tags?.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty },
+            aiAnalysis: ClothingAIAnalysis(
+                style: cleaned(style),
+                seasons: cleaned(seasons),
+                materials: cleaned(materials),
+                silhouette: silhouette?.nilIfBlank,
+                pattern: pattern?.nilIfBlank,
+                occasions: cleaned(occasions),
+                formality: formality?.nilIfBlank,
+                warmth: warmth?.nilIfBlank
+            )
         )
     }
 
@@ -232,6 +288,10 @@ private struct SiliconFlowAutoTagPayload: Decodable {
     private var brandValue: String? {
         guard let brand = brand?.nilIfBlank else { return nil }
         return brand.lowercased() == "null" ? nil : brand
+    }
+
+    private func cleaned(_ values: [String]?) -> [String] {
+        (values ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 }
 

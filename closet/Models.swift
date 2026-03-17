@@ -97,6 +97,12 @@ enum StylistMode: String, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
 }
 
+enum OutfitCoverSource: String, CaseIterable, Codable {
+    case canvas
+    case tryOn
+    case realPhoto
+}
+
 enum GarmentGradient: String, CaseIterable, Codable {
     case mist
     case denim
@@ -111,6 +117,39 @@ enum DiaryMatchSource: String, Codable {
     case manuallyAdjusted
 }
 
+struct ClothingAIAnalysis: Codable, Equatable {
+    var style: [String]
+    var seasons: [String]
+    var materials: [String]
+    var silhouette: String?
+    var pattern: String?
+    var occasions: [String]
+    var formality: String?
+    var warmth: String?
+
+    static let empty = ClothingAIAnalysis(
+        style: [],
+        seasons: [],
+        materials: [],
+        silhouette: nil,
+        pattern: nil,
+        occasions: [],
+        formality: nil,
+        warmth: nil
+    )
+
+    var hasContent: Bool {
+        !style.isEmpty ||
+        !seasons.isEmpty ||
+        !materials.isEmpty ||
+        silhouette != nil ||
+        pattern != nil ||
+        !occasions.isEmpty ||
+        formality != nil ||
+        warmth != nil
+    }
+}
+
 struct ClosetItem: Identifiable, Codable, Equatable {
     let id: UUID
     var name: String
@@ -123,6 +162,7 @@ struct ClosetItem: Identifiable, Codable, Equatable {
     var symbol: String
     var gradientName: String
     var imageFileName: String?
+    var aiAnalysis: ClothingAIAnalysis
     var createdAt: Date
 
     init(
@@ -137,6 +177,7 @@ struct ClosetItem: Identifiable, Codable, Equatable {
         symbol: String? = nil,
         gradientName: String,
         imageFileName: String? = nil,
+        aiAnalysis: ClothingAIAnalysis = .empty,
         createdAt: Date = .now
     ) {
         self.id = id
@@ -150,6 +191,7 @@ struct ClosetItem: Identifiable, Codable, Equatable {
         self.symbol = symbol ?? section.symbol
         self.gradientName = gradientName
         self.imageFileName = imageFileName
+        self.aiAnalysis = aiAnalysis
         self.createdAt = createdAt
     }
 }
@@ -162,9 +204,15 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
     var accent: String
     var itemIDs: [UUID]
     var itemLayouts: [OutfitItemLayout]
+    var outfitCategory: String?
+    var tags: [String]
+    var aiSummary: String?
     var createdAt: Date
     var sourceMode: StylistMode
     var photoFileName: String?
+    var tryOnImageFileName: String?
+    var realPhotoFileName: String?
+    var coverImageSource: OutfitCoverSource
 
     init(
         id: UUID = UUID(),
@@ -174,9 +222,15 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         accent: String,
         itemIDs: [UUID],
         itemLayouts: [OutfitItemLayout] = [],
+        outfitCategory: String? = nil,
+        tags: [String] = [],
+        aiSummary: String? = nil,
         createdAt: Date = .now,
         sourceMode: StylistMode,
-        photoFileName: String? = nil
+        photoFileName: String? = nil,
+        tryOnImageFileName: String? = nil,
+        realPhotoFileName: String? = nil,
+        coverImageSource: OutfitCoverSource = .canvas
     ) {
         self.id = id
         self.title = title
@@ -185,9 +239,71 @@ struct OutfitPreview: Identifiable, Codable, Equatable {
         self.accent = accent
         self.itemIDs = itemIDs
         self.itemLayouts = itemLayouts
+        self.outfitCategory = outfitCategory
+        self.tags = tags
+        self.aiSummary = aiSummary
         self.createdAt = createdAt
         self.sourceMode = sourceMode
-        self.photoFileName = photoFileName
+        self.tryOnImageFileName = tryOnImageFileName ?? photoFileName
+        self.realPhotoFileName = realPhotoFileName
+        self.coverImageSource = coverImageSource
+        self.photoFileName = photoFileName ?? {
+            switch coverImageSource {
+            case .canvas:
+                return nil
+            case .tryOn:
+                return tryOnImageFileName
+            case .realPhoto:
+                return realPhotoFileName
+            }
+        }()
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case title
+        case subtitle
+        case symbol
+        case accent
+        case itemIDs
+        case itemLayouts
+        case outfitCategory
+        case tags
+        case aiSummary
+        case createdAt
+        case sourceMode
+        case photoFileName
+        case tryOnImageFileName
+        case realPhotoFileName
+        case coverImageSource
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        subtitle = try container.decode(String.self, forKey: .subtitle)
+        symbol = try container.decode(String.self, forKey: .symbol)
+        accent = try container.decode(String.self, forKey: .accent)
+        itemIDs = try container.decode([UUID].self, forKey: .itemIDs)
+        itemLayouts = try container.decodeIfPresent([OutfitItemLayout].self, forKey: .itemLayouts) ?? []
+        outfitCategory = try container.decodeIfPresent(String.self, forKey: .outfitCategory)
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        aiSummary = try container.decodeIfPresent(String.self, forKey: .aiSummary)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+        sourceMode = try container.decode(StylistMode.self, forKey: .sourceMode)
+        photoFileName = try container.decodeIfPresent(String.self, forKey: .photoFileName)
+        tryOnImageFileName = try container.decodeIfPresent(String.self, forKey: .tryOnImageFileName) ?? photoFileName
+        realPhotoFileName = try container.decodeIfPresent(String.self, forKey: .realPhotoFileName)
+        if let decodedCoverImageSource = try container.decodeIfPresent(OutfitCoverSource.self, forKey: .coverImageSource) {
+            coverImageSource = decodedCoverImageSource
+        } else if realPhotoFileName == photoFileName, realPhotoFileName != nil {
+            coverImageSource = .realPhoto
+        } else if photoFileName != nil {
+            coverImageSource = .tryOn
+        } else {
+            coverImageSource = .canvas
+        }
     }
 }
 
@@ -388,14 +504,38 @@ struct OutfitDraft {
     var itemIDs: Set<UUID> = []
     var itemLayouts: [OutfitItemLayout] = []
     var photoFileName: String?
+    var tryOnImageFileName: String?
+    var realPhotoFileName: String?
+    var coverImageSource: OutfitCoverSource = .canvas
 
     init() {}
+
+    init(
+        title: String,
+        itemIDs: Set<UUID>,
+        itemLayouts: [OutfitItemLayout],
+        photoFileName: String?,
+        tryOnImageFileName: String? = nil,
+        realPhotoFileName: String? = nil,
+        coverImageSource: OutfitCoverSource = .canvas
+    ) {
+        self.title = title
+        self.itemIDs = itemIDs
+        self.itemLayouts = itemLayouts
+        self.photoFileName = photoFileName
+        self.tryOnImageFileName = tryOnImageFileName
+        self.realPhotoFileName = realPhotoFileName
+        self.coverImageSource = coverImageSource
+    }
 
     init(outfit: OutfitPreview) {
         title = outfit.title
         itemIDs = Set(outfit.itemIDs)
         itemLayouts = outfit.itemLayouts
         photoFileName = outfit.photoFileName
+        tryOnImageFileName = outfit.tryOnImageFileName
+        realPhotoFileName = outfit.realPhotoFileName
+        coverImageSource = outfit.coverImageSource
     }
 }
 
@@ -408,6 +548,7 @@ struct AddItemDraft {
     var price = ""
     var gradientName: GarmentGradient = .mist
     var imageFileName: String?
+    var aiAnalysis: ClothingAIAnalysis = .empty
 
     init() {}
 
@@ -420,6 +561,7 @@ struct AddItemDraft {
         price = item.price > 0 ? "\(item.price)" : ""
         gradientName = GarmentGradient(rawValue: item.gradientName) ?? .mist
         imageFileName = item.imageFileName
+        aiAnalysis = item.aiAnalysis
     }
 }
 
